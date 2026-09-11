@@ -1,0 +1,92 @@
+name: test configure (lightweight)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "trae/**"
+    paths:
+      - "scripts/configure"
+      - ".github/workflows/test-configure.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          path: repo
+
+      - name: Build mock kernel tree
+        run: |
+          set -e
+          mkdir -p /tmp/mock/kernel_workspace/kernel_platform/common/arch/arm64/configs
+          mkdir -p /tmp/mock/kernel_workspace/kernel_platform/common/arch/arm64/lib
+          printf 'VERSION = 6\nPATCHLEVEL = 6\nSUBLEVEL = 89\nNAME = mock\n' \
+            > /tmp/mock/kernel_workspace/kernel_platform/common/Makefile
+          printf 'CONFIG_ZRAM=m\nCONFIG_FOO=y\n' \
+            > /tmp/mock/kernel_workspace/kernel_platform/common/arch/arm64/configs/gki_defconfig
+
+      # configure 会尝试真实 git clone / curl；本测试只关心 configure 自身逻辑
+      # （参数解析、版本探测、defconfig 追加、sed、summary）。用 no-op mock 使测试
+      # 完全离线、快速、确定，避免依赖外部网络/仓库。
+      - name: Mock git/curl (offline deterministic)
+        run: |
+          mkdir -p /tmp/mockbin
+          printf '#!/bin/bash\nexit 0\n' > /tmp/mockbin/git
+          printf '#!/bin/bash\nexit 0\n' > /tmp/mockbin/curl
+          chmod +x /tmp/mockbin/git /tmp/mockbin/curl
+
+      - name: Run configure (RESUKISU + SUSFS + ZRAM LZ4 + mountify)
+        run: |
+          export PATH="/tmp/mockbin:$PATH"
+          cd /tmp/mock/kernel_workspace
+          cp "$GITHUB_WORKSPACE/repo/scripts/configure" ./configure
+          chmod +x ./configure
+          ./configure --ksu-variant RESUKISU --ksu-branch default --susfs --zram LZ4 --mountify
+
+      - name: Assert config output
+        run: |
+          DF=/tmp/mock/kernel_workspace/kernel_platform/common/arch/arm64/configs/gki_defconfig
+          S=/tmp/mock/kernel_workspace/config_summary.txt
+          for pat in \
+              'CONFIG_KSU_SUSFS=y' \
+              'CONFIG_ZRAM=y' \
+              'CONFIG_ZRAM_WRITEBACK=y' \
+              'CONFIG_KSU_MOUNTIFY=y' \
+              'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@%REPO_NAME%"' ; do
+            grep -F "$pat" "$DF" >/dev/null || { echo "MISSING in defconfig: $pat"; exit 1; }
+          done
+          grep -F 'SUSFS Support: Enabled' "$S" >/dev/null || { echo "missing SUSFS summary"; exit 1; }
+          grep -F 'ZRAM Option: LZ4' "$S" >/dev/null || { echo "missing ZRAM summary"; exit 1; }
+          grep -F 'Kernel Version: 6.6.89' "$S" >/dev/null || { echo "missing kernel version summary"; exit 1; }
+          grep -F 'Mountify Support: Enabled' "$S" >/dev/null || { echo "missing Mountify summary"; exit 1; }
+          echo "ALL ASSERTIONS PASSED"
+
+      - name: Run configure (SUKISU + KPM + disable multi-manager + no-ver-edit)
+        run: |
+          export PATH="/tmp/mockbin:$PATH"
+          cd /tmp/mock/kernel_workspace
+          cp "$GITHUB_WORKSPACE/repo/scripts/configure" ./configure
+          chmod +x ./configure
+          printf 'CONFIG_ZRAM=m\nCONFIG_FOO=y\n' \
+            > kernel_platform/common/arch/arm64/configs/gki_defconfig
+          ./configure --ksu-variant SUKISU --ksu-branch default --kpm --multi-manager --no-ver-edit
+
+      - name: Assert second config output
+        run: |
+          DF=/tmp/mock/kernel_workspace/kernel_platform/common/arch/arm64/configs/gki_defconfig
+          S=/tmp/mock/kernel_workspace/config_summary.txt
+          grep -F 'CONFIG_KSU_KPM=true' "$DF" >/dev/null || { echo "MISSING KPM config"; exit 1; }
+          grep -F 'CONFIG_KSU_MULTI_MANAGER=n' "$DF" >/dev/null || { echo "MISSING multi-manager config"; exit 1; }
+          if grep -F 'CONFIG_KSU_FULL_NAME_FORMAT' "$DF" >/dev/null; then
+            echo "no-ver-edit FAILED: version format still present"; exit 1
+          fi
+          grep -F 'KPM Support: Enabled' "$S" >/dev/null || { echo "missing KPM summary"; exit 1; }
+          grep -F 'Multi Manager Support: Disabled' "$S" >/dev/null || { echo "missing multi-manager summary"; exit 1; }
+          grep -F 'Version Edit in gki_defconfig: Disabled' "$S" >/dev/null || { echo "missing no-ver-edit summary"; exit 1; }
+          echo "ALL ASSERTIONS PASSED"
