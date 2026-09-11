@@ -12,12 +12,12 @@ Oneplus ACE6 kernel builder, can integrate KernelSU or its various and SUSFS.
 
 This repository provides a GitHub Actions-based automated build script suite for compiling the OnePlus ACE6 kernel, with built-in support for integrating KernelSU or ots various and SUSFS features.
 
-It includes GitHub Actions workflow files and prebuilt auxiliary tools, without any OEM kernel source code — the kernel source code must be obtained separately from official OEM channels.
+It includes GitHub Actions workflow files and an open-source build helper, without any OEM kernel source code — the kernel source code must be obtained separately from official OEM channels.
 
-The prebuilt tool `scripts/configure` acts as a build-time helper:
+The open-source tool `scripts/configure` (Python) acts as a build-time helper:
 
-- Only when specific features (KPM) are enabled, it automatically modifies `arch/arm64/Makefile` and applies patches, ensuring the final kernel image has the target features integrated as expected.
-- It includes strict whitelist and blacklist verification logic: whitelisted users get unrestricted access to all features, while blacklisted users will have the entire build process directly blocked.
+- It parses the same CLI arguments the workflow passes (`--ksu-variant`, `--ksu-branch`, `--susfs`, `--zram LZ4|LZ4KD`, `--kpm`, `--mountify`, `--ntsync`, `--fengchi`, `--droidspace`, `--with-bbg`, `--hookless`, `--multi-manager`, `--no-ver-edit`), installing the selected KernelSU variant, integrating SUSFS when enabled (including the ReSukiSU/NEXT "integrated branch" path), applying optional feature patches, and appending CONFIG lines to `gki_defconfig`.
+- It contains **no whitelist/blacklist remote-control logic**. All features are driven purely by local CLI switches, and the script is fully auditable.
 
 ## Usage
 
@@ -36,7 +36,7 @@ The prebuilt tool `scripts/configure` acts as a build-time helper:
 |Component|License|Detail|
 |-|-|-|
 |GitHub Actions Workflows|MIT License| See the LICENSE file for details |
-|Prebuilt Binary (`scripts/configure`) |BSD 2-Clause License |See the LICENSE-scripts-configure file for details |
+|Open-Source Helper (`scripts/configure`) |MIT License|See the LICENSE file for details |
 OEM Kernel Source Code |GPLv2 License| Comply with the original terms of the OEM kernel |
 
 ## Important Notes
@@ -47,6 +47,6 @@ OEM Kernel Source Code |GPLv2 License| Comply with the original terms of the OEM
 
 3. When redistributing this repository, the original copyright notice and license text must be retained. When redistributing the compiled kernel package, users only need to comply with the GPLv2 terms of the OEM kernel and do not need to include the license information of this repository.
 
-4. The maintainer reserves the right of access control via the whitelist/blacklist logic in `scripts/configure`, which does not violate the terms of the BSD 2-Clause License.
+4. `scripts/configure` is an open-source build helper with no remote access-control (whitelist/blacklist) logic.
 
  

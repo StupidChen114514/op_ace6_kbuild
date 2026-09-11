@@ -6,12 +6,13 @@ Oneplus ACE6 内核构建脚本，可以集成KernelSU及其变体 也包括SUSF
 
 本仓库提供一套基于 GitHub Actions 的自动化构建脚本套件，用于编译一加 ACE6 内核，内置 KernelSU 与 SUSFS 功能集成支持。
 
-仓库包含 GitHub Actions 工作流文件及预编译辅助工具，不包含任何 OEM 内核源码 —— 内核源码需从 OEM 官方渠道另行获取。
+仓库包含 GitHub Actions 工作流文件及开源构建辅助脚本，不包含任何 OEM 内核源码 —— 内核源码需从 OEM 官方渠道另行获取。
 
-预编译工具 `scripts/configure` 作为构建阶段辅助程序，具备以下核心能力：
+开源脚本 `scripts/configure`（Python）作为构建阶段辅助程序，具备以下核心能力：
 
+- 解析工作流传入的同一套命令行参数（`--ksu-variant`、`--ksu-branch`、`--susfs`、`--zram LZ4|LZ4KD`、`--kpm`、`--mountify`、`--ntsync`、`--fengchi`、`--droidspace`、`--with-bbg`、`--hookless`、`--multi-manager`、`--no-ver-edit`），安装所选 KernelSU 变体、按需集成 SUSFS（含 ReSukiSU/NEXT 的"集成分支"路径）、应用可选功能补丁，并向 `gki_defconfig` 追加 CONFIG。
+- 脚本**不含任何白名单/黑名单远程控制逻辑**，所有功能均由本地开关驱动，完全可审计。
 - 仅在开启特定功能（KPM）时，自动修改 `arch/arm64/Makefile` 并打补丁，确保最终生成的内核镜像按需集成目标功能。
-- 内置严格的白名单与黑名单校验机制：白名单用户可无限制启用所有受限功能，黑名单用户则会被直接阻止整个构建流程。
 
 ## 使用方法 
 
@@ -28,7 +29,7 @@ Oneplus ACE6 内核构建脚本，可以集成KernelSU及其变体 也包括SUSF
 |组件|许可证|详情|
 |--|--|--|
 |GitHub Actions 工作流|MIT 许可证|详见根目录 LICENSE 文件|
-|预编译二进制文件 (`scripts/configure`)|BSD 2-Clause 许可证|详见根目录 LICENSE-scripts-configure 文件|
+|开源辅助脚本 (`scripts/configure`)|MIT 许可证|详见根目录 LICENSE 文件|
 |OEM 内核源码|GPLv2 许可证|遵守 OEM 内核的原始许可条款 |
 
 ## 重要说明
@@ -39,4 +40,4 @@ Oneplus ACE6 内核构建脚本，可以集成KernelSU及其变体 也包括SUSF
 
 3. 分发本仓库时，必须保留原始版权声明与许可证文本；分发编译后的内核包时，仅需遵守 OEM 内核的 GPLv2 条款，无需附带本仓库的许可信息。
 
-4. 维护者保留通过 `scripts/configure` 内置的黑白名单机制进行访问控制的权利，该限制不违反 BSD 2-Clause 许可证条款。
+4. `scripts/configure` 为开源构建辅助脚本，不含任何白名单/黑名单远程控制逻辑。
