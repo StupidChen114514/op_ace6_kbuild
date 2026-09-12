@@ -363,7 +363,8 @@ def main(argv=None):
 
     # ---- 4) KPM（SukiSU only，行为基线 §6）----
     if args.kpm and variant == "SUKISU":
-        append_defconfig(kernel_common, ["CONFIG_KSU_KPM=true"])
+        # 对齐 SukiSU Kconfig：KPM 符号是 CONFIG_KPM（bool=y），非 CONFIG_KSU_KPM
+        append_defconfig(kernel_common, ["CONFIG_KPM=y"])
         # 改写 arch/arm64/Makefile 接入 KPM 钩子（行为基线仅定位流程，细节为保守实现）
         mk = os.path.join(kernel_common, "arch", "arm64", "Makefile")
         if os.path.isfile(mk):
@@ -498,9 +499,10 @@ def main(argv=None):
             apply_patch(d, cwd=kernel_common)
         except Exception as e:
             log(f"warning: hookless/suki-syscall-hooks 补丁失败: {e}")
-    # --multi-manager（store_false：默认开，显式传参即关；ReSukiSU only）
-    if not args.multi_manager:
-        append_defconfig(kernel_common, ["CONFIG_KSU_MULTI_MANAGER=n"])
+    # --multi-manager（store_false：默认开即多管理器启用，显式传参即关；ReSukiSU only）
+    # 真实符号：KSU_MULTI_MANAGER_SUPPORT（ReSukiSU Kconfig）
+    mm_val = "y" if args.multi_manager else "n"
+    append_defconfig(kernel_common, [f"CONFIG_KSU_MULTI_MANAGER_SUPPORT={mm_val}"])
 
     # ---- 8) 统一 defconfig sed 处理（行为基线 §5）----
     df = os.path.join(kernel_common, "arch", "arm64", "configs", "gki_defconfig")
