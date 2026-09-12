@@ -245,7 +245,7 @@ def ensure_lsm_in_defconfig(kernel_common, lsm="baseband_guard",
 def build_parser():
     p = argparse.ArgumentParser(description=DESCRIPTION)
     variants = list(KSU_VARIANTS.keys())
-    p.add_argument("--ksu-variant", default="KSU", choices=variants,
+    p.add_argument("--ksu-variant", default="default", choices=variants,
                    help="Set KernelSU variant")
     p.add_argument("--ksu-branch", default="default",
                    help="Set the branch of KernelSU to use (default: default)")
@@ -275,7 +275,7 @@ def main(argv=None):
     kernel_common = find_kernel_common(base)
     kver = get_kernel_version(kernel_common)
     variant = args.ksu_variant.upper()
-    vinfo = KSU_VARIANTS.get(variant, KSU_VARIANTS["KSU"])
+    vinfo = KSU_VARIANTS.get(variant) or KSU_VARIANTS.get("default")
 
     log(f"Kernel version detected: {kver}")
     log(f"KSU variant: {variant}, branch: {args.ksu_branch}")
@@ -298,11 +298,20 @@ def main(argv=None):
             log("Applied fix_display_for_118.patch")
         except Exception as e:
             log(f"warning: display patch 应用失败: {e}")
+    # 把 CVE/显示补丁落盘到内核树 root（对齐基线 §4/§5 "出现在 kernel_platform/common/ 下"）
+    for p, land_name in ((cve_patch, "fix_CVE_2026_43499.patch"),
+                         (disp_patch, "fix_display_for_118.patch")):
+        if os.path.isfile(p):
+            try:
+                sh(["cp", "-f", p, os.path.join(kernel_common, land_name)])
+            except Exception:
+                pass
 
     # ---- 2) KSU 变体注入：clone 对应仓库并执行 kernel/setup.sh（行为基线 §2）----
     ksu_dir = os.path.join(base, "KernelSU")
     repo_url = f"https://github.com/{vinfo['repo']}.git"
-    branch = vinfo["branch"]
+    # --ksu-branch 覆盖克隆分支；default 表示使用该变体的默认分支（对齐基线 §1）
+    branch = args.ksu_branch if args.ksu_branch != "default" else vinfo["branch"]
     try:
         git_clone(repo_url, branch, ksu_dir, cwd=base)
         setup = os.path.join(ksu_dir, "kernel", "setup.sh")
@@ -316,12 +325,20 @@ def main(argv=None):
 
     # ---- 3) SUSFS（行为基线 §3）----
     if args.susfs:
-        susfs_cfg = SUSFS_REPO_BY_KERNEL.get(kver, SUSFS_REPO_BY_KERNEL[SUSFS_REPO_DEFAULT])
-        host = susfs_cfg["host"]
-        susfs_repo_url = f"https://{host}/{susfs_cfg['repo']}.git"
+        # 变体专属 SUSFS 分支（MAMBOSU=susfs-mambo-master、NEXT=dev-susfs）：
+        # 从该变体自己的 KernelSU 仓库对应分支取 SUSFS；否则按内核版本用 susfs4ksu。
+        if vinfo.get("susfs_branch"):
+            susfs_repo_url = f"https://github.com/{vinfo['repo']}.git"
+            susfs_branch = vinfo["susfs_branch"]
+            susfs_log_repo = f"{vinfo['repo']}:{susfs_branch}"
+        else:
+            susfs_cfg = SUSFS_REPO_BY_KERNEL.get(kver, SUSFS_REPO_BY_KERNEL[SUSFS_REPO_DEFAULT])
+            susfs_repo_url = f"https://{susfs_cfg['host']}/{susfs_cfg['repo']}.git"
+            susfs_branch = susfs_cfg["branch"]
+            susfs_log_repo = susfs_cfg["repo"]
         try:
             susfs_dir = os.path.join(base, "SUSFS")
-            git_clone(susfs_repo_url, susfs_cfg["branch"], susfs_dir, cwd=base)
+            git_clone(susfs_repo_url, susfs_branch, susfs_dir, cwd=base)
             # 1) 把 susfs 源码与头文件并入内核树（kernel_patches/fs、kernel_patches/include）
             #    这提供 fs/susfs.c 和 include/linux/{susfs.h,susfs_def.h}，
             #    其中 susfs_def.h 定义了 ResukiSU 依赖的 susfs_*_no_su 等 static inline。
@@ -338,7 +355,7 @@ def main(argv=None):
                 apply_patch(ksu_patch, cwd=kernel_common)
             # 4) defconfig 启用 SUSFS 钩子
             append_defconfig(kernel_common, [CONFIG_KSU_SUSFS_Y])
-            log(f"SUSFS integrated (variant={variant}, repo={susfs_cfg['repo']})")
+            log(f"SUSFS integrated (variant={variant}, repo={susfs_log_repo})")
         except Exception as e:
             log(f"error: SUSFS 集成失败: {e}")
     else:
@@ -363,7 +380,10 @@ def main(argv=None):
             if not os.access(patch_bin, os.X_OK):
                 log("warning: patch_linux 不可执行或不存在，跳过 KPM patch_linux 调用")
             else:
-                sh([patch_bin, img], cwd=os.path.dirname(img))
+                # 对齐基线 §6：先把 Image 拷贝到当前工作目录（base），再以该副本调用 patch_linux
+                moved_img = os.path.join(base, "Image")
+                sh(["cp", "-f", img, moved_img])
+                sh([patch_bin, "Image"], cwd=base)
         log("KPM enabled (SukiSU)")
 
     # ---- 5) ZRAM（行为基线 §5/§7）----
@@ -371,12 +391,21 @@ def main(argv=None):
     zram_cfg = []
     if zram == "LZ4":
         zram_cfg += ["CONFIG_ZRAM=y", "CONFIG_ZRAM_WRITEBACK=y"]
+        zram_repo = "https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8750/main/zram_patch"
         try:
+            # 001-lz4：LZ4 使能补丁（基线 §7）
+            d1 = os.path.join(patches_dir, "001-lz4.patch")
+            download(f"{zram_repo}/001-lz4", d1)
+            apply_patch(d1, cwd=kernel_common)
+        except Exception as e:
+            log(f"warning: LZ4 001-lz4 补丁失败（继续拷贝 asm）: {e}")
+        try:
+            # lz4armv8.S：arm64 LZ4 实现
             d = os.path.join(patches_dir, "zram_lz4armv8.S")
-            download(f"https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8750/main/zram_patch/lz4armv8.S", d)
+            download(f"{zram_repo}/lz4armv8.S", d)
             sh(["cp", d, os.path.join(kernel_common, "arch", "arm64", "lib")])
         except Exception as e:
-            log(f"warning: LZ4 zram 补丁下载/应用失败: {e}")
+            log(f"warning: LZ4 lz4armv8.S 下载/拷贝失败: {e}")
     elif zram == "LZ4KD":
         zram_cfg += ["CONFIG_ZRAM=y", "CONFIG_ZRAM_LZ4KD=y"]
         try:
@@ -386,6 +415,14 @@ def main(argv=None):
         except Exception as e:
             log(f"warning: LZ4KD 补丁失败: {e}")
     if zram in ("LZ4", "LZ4KD"):
+        # 基线 §7：6.6.118 需 upgrade zram 库到 1.10.0
+        if kver == "6.6.118":
+            try:
+                zup = os.path.join(patches_dir, "lib-update-zram-118.patch")
+                download(PATCH_ZRAM_LIB_118, zup)
+                apply_patch(zup, cwd=kernel_common)
+            except Exception as e:
+                log(f"warning: zram 库升级补丁失败: {e}")
         append_defconfig(kernel_common, zram_cfg)
 
     # ---- 6) 版本号改写（行为基线 §5，--no-ver-edit 关闭）----
@@ -442,12 +479,25 @@ def main(argv=None):
         except Exception as e:
             log(f"warning: ntsync 补丁失败: {e}")
     if args.hookless:
+        # 基线 §7：hookless/manual hook 来自三条补丁，逐条应用（失败各自降级）
         try:
             d = os.path.join(patches_dir, "hookless.patch")
             download(PATCH_MANUAL_HOOK, d)
             apply_patch(d, cwd=kernel_common)
         except Exception as e:
-            log(f"warning: hookless 补丁失败: {e}")
+            log(f"warning: hookless/manual_hook 补丁失败: {e}")
+        try:
+            d = os.path.join(patches_dir, "scope-hooks.patch")
+            download(PATCH_SCOPE_HOOKS, d)
+            apply_patch(d, cwd=kernel_common)
+        except Exception as e:
+            log(f"warning: hookless/scope-hooks 补丁失败: {e}")
+        try:
+            d = os.path.join(patches_dir, "suki-syscall-hooks.patch")
+            download(PATCH_SUKISU_HOOKS, d)
+            apply_patch(d, cwd=kernel_common)
+        except Exception as e:
+            log(f"warning: hookless/suki-syscall-hooks 补丁失败: {e}")
     # --multi-manager（store_false：默认开，显式传参即关；ReSukiSU only）
     if not args.multi_manager:
         append_defconfig(kernel_common, ["CONFIG_KSU_MULTI_MANAGER=n"])
@@ -456,8 +506,8 @@ def main(argv=None):
     df = os.path.join(kernel_common, "arch", "arm64", "configs", "gki_defconfig")
     if os.path.isfile(df):
         sed_file("-4k", "", df)
-        if zram not in ("LZ4", "LZ4KD"):
-            sed_file("CONFIG_ZRAM=m", "CONFIG_ZRAM=y", df)
+        # 基线 §5：无条件把 CONFIG_ZRAM=m 改为 y（对 LZ4/LZ4KD 追加的 =y 无副作用）
+        sed_file("CONFIG_ZRAM=m", "CONFIG_ZRAM=y", df)
 
     # ---- 9) config_summary.txt（行为基线 §1 / buildbot.py 读取）----
     summary = (
