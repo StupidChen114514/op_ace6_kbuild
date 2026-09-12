@@ -47,14 +47,13 @@ KSU_VARIANTS = {
                  "susfs_intregated": "manual"},
 }
 
-# SUSFS 仓库来源：按内核版本分流（对齐原版二进制日志 + ResukiSU 兼容性）。
-# 注意：ResukiSU 的 kernel/hook/setuid_hook.c 依赖 susfs_*_no_su 系列
-# (static inline 于 kernel_patches/include/linux/susfs_def.h)，
-# 只有 simonpunk/susfs4ksu 提供；luyanci/susfs4oki 缺失这些 API。
-# 因此 6.6.89 的 RESUKISU 集成分支也用 susfs4ksu（原版日志实证 clone susfs4ksu）。
+# SUSFS 仓库来源：按内核版本分流（对齐 cctv18/oppo_oplus_realme_sm8750 对该 OnePlus 内核的实证做法）。
+# 该内核是 android_kernel_common_oneplus_sm8750（非 stock GKI），必须用 susfs4oki 的
+# oki-android15-6.6 分支，其 50_add_susfs_in_gki 补丁才能干净应用；
+# simonpunk/susfs4ksu 的补丁针对 stock GKI，打不上（fs/exec.c、fs/proc/base.c、sched.h 上下文不符）。
 SUSFS_REPO_BY_KERNEL = {
-    "6.6.89":  {"repo": "simonpunk/susfs4ksu", "branch": "gki-android15-6.6", "host": "gitlab.com"},
-    "6.6.118": {"repo": "simonpunk/susfs4ksu", "branch": "gki-android15-6.6", "host": "gitlab.com"},
+    "6.6.89":  {"repo": "luyanci/susfs4oki", "branch": "oki-android15-6.6", "host": "github.com"},
+    "6.6.118": {"repo": "luyanci/susfs4oki", "branch": "oki-android15-6.6", "host": "github.com"},
 }
 SUSFS_REPO_DEFAULT = "6.6.118"
 
@@ -452,10 +451,17 @@ def main(argv=None):
         except Exception as e:
             log(f"warning: BBG 安装失败: {e}")
         # bbg/setup.sh 只提示"手动设置 defconfig"；原闭源二进制会自动完成。
-        # 这里做等价自动集成：启用 CONFIG_BBG 并把 baseband_guard 追加进 CONFIG_LSM，
-        # 否则 HAS_DEFINE_LSM（GKI）内核会在 security/baseband-guard/Makefile 直接 abort。
+        # 这里做等价自动集成：启用 CONFIG_BBG + 把 baseband_guard 追加进 CONFIG_LSM。
+        # 注意：本内核(CONFIG_LSM 来自 Kconfig default)仅写 defconfig 不生效(日志实证)，
+        #       因此按 cctv18 的做法**同时改 security/Kconfig 的 config LSM default**。
         append_defconfig(kernel_common, ["CONFIG_BBG=y"])
         ensure_lsm_in_defconfig(kernel_common, lsm="baseband_guard")
+        kcfg = os.path.join(kernel_common, "security", "Kconfig")
+        if os.path.isfile(kcfg):
+            sed_expr = ("/^config LSM$/,/^help$/{ "
+                        "/^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }")
+            sh(["sed", "-i", sed_expr, kcfg], cwd=kernel_common)
+            log("security/Kconfig: CONFIG_LSM default 注入 baseband_guard")
     if args.mountify:
         # mountify = backslashxx/mountify（KSU metamodule，OverlayFS 运行时挂载隐藏，非内核补丁）。
         # 其 README 要求 CONFIG_OVERLAY_FS=y（必需）+ CONFIG_TMPFS_XATTR=y（强烈建议），
