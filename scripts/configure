@@ -80,6 +80,10 @@ PATCH_SUKISU_HOOKS    = "https://github.com/SukiSU-Ultra/SukiSU_patch/raw/main/h
 BBG_SETUP             = "vc-teahouse/Baseband-guard/main/setup.sh"
 DROIDSPACE_ZRAM_REPO  = "cctv18/oppo_oplus_realme_sm8750"   # main/zram_patch/{001-lz4,...,lz4armv8.S}
 
+# KPM = KPatch-Next 后置 Image 补丁（参考 oppo_oplus_realme_sm8750 local/builder_*.sh）
+KPM_KPTOOLS = "https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kptools-linux"
+KPM_KPIMG   = "https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kpimg-linux"
+
 # gki_defconfig 追加的 CONFIG（保守、对齐基线可确认项；缺省为最简可用集）
 CONFIG_KSU_SUSFS_Y  = "CONFIG_KSU_SUSFS=y"
 CONFIG_KSU_SUSFS_N  = "CONFIG_KSU_SUSFS=n"
@@ -361,31 +365,35 @@ def main(argv=None):
     else:
         append_defconfig(kernel_common, [CONFIG_KSU_SUSFS_N, CONFIG_KSU_HOOK_N])
 
-    # ---- 4) KPM（SukiSU only，行为基线 §6）----
-    if args.kpm and variant == "SUKISU":
-        # 对齐 SukiSU Kconfig：KPM 符号是 CONFIG_KPM（bool=y），非 CONFIG_KSU_KPM
-        append_defconfig(kernel_common, ["CONFIG_KPM=y"])
-        # 改写 arch/arm64/Makefile 接入 KPM 钩子（行为基线仅定位流程，细节为保守实现）
-        mk = os.path.join(kernel_common, "arch", "arm64", "Makefile")
-        if os.path.isfile(mk):
-            with open(mk, "a") as f:
-                f.write("\n# --- KPM hook (configure) ---\n")
+    # ---- 4) KPM（KPatch-Next 后置 Image 补丁，参考 oppo_oplus_realme_sm8750）----
+    # 说明：KPM 不在编译期改 CONFIG_KPM / arch/arm64/Makefile，而是用 KPatch-Next 的
+    #       kptools-linux 对**已编译的 Image** 打补丁（把 kpimg-linux 并进内核镜像）。
+    #       configure 在此仅负责：下载工具 + （给了 --kpm-patch 时）对指定 Image 打补丁。
+    if args.kpm:
+        kptools = os.path.join(base, "kptools-linux")
+        kpimg = os.path.join(base, "kpimg-linux")
+        try:
+            download(KPM_KPTOOLS, kptools)
+            download(KPM_KPIMG, kpimg)
+            os.chmod(kptools, 0o755)
+            log("KPatch-Next kptools-linux / kpimg-linux downloaded")
+        except Exception as e:
+            log(f"warning: KPM 工具下载失败: {e}")
         if args.kpm_patch:
-            # 用本地 patch_linux 对 Image 打 KPM 补丁（对齐基线：patch_linux + Image 命名校验）
-            patch_bin = os.path.join(base, "patch_linux")
             img = os.path.abspath(args.kpm_patch)
             if not os.path.isfile(img):
                 raise SystemExit(f"Image not found: {img}")
             if os.path.basename(img) != "Image":
                 raise SystemExit(f"Image file name must be 'Image', got '{os.path.basename(img)}'")
-            if not os.access(patch_bin, os.X_OK):
-                log("warning: patch_linux 不可执行或不存在，跳过 KPM patch_linux 调用")
+            if not os.path.isfile(kptools) or not os.access(kptools, os.X_OK):
+                log("warning: kptools-linux 缺失，跳过 KPM Image 补丁")
             else:
-                # 对齐基线 §6：先把 Image 拷贝到当前工作目录（base），再以该副本调用 patch_linux
-                moved_img = os.path.join(base, "Image")
-                sh(["cp", "-f", img, moved_img])
-                sh([patch_bin, "Image"], cwd=base)
-        log("KPM enabled (SukiSU)")
+                # 对齐参考：kptools-linux -p -i Image -k kpimg-linux -o oImage
+                out_img = img + ".kpm"
+                sh([kptools, "-p", "-i", img, "-k", kpimg, "-o", out_img], cwd=base)
+                os.replace(out_img, img)
+                log("KPM(Image) 补丁完成 (KPatch-Next)")
+        log("KPM enabled (KPatch-Next)")
 
     # ---- 5) ZRAM（行为基线 §5/§7）----
     zram = args.zram.upper()
