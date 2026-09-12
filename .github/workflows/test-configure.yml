@@ -86,8 +86,8 @@ jobs:
         run: |
           DF=/tmp/mock/kernel_workspace/kernel_platform/common/arch/arm64/configs/gki_defconfig
           S=/tmp/mock/kernel_workspace/config_summary.txt
-          grep -F 'CONFIG_KSU_KPM=true' "$DF" >/dev/null || { echo "MISSING KPM config"; exit 1; }
-          grep -F 'CONFIG_KSU_MULTI_MANAGER=n' "$DF" >/dev/null || { echo "MISSING multi-manager config"; exit 1; }
+          grep -F 'CONFIG_KPM=y' "$DF" >/dev/null || { echo "MISSING KPM config"; exit 1; }
+          grep -F 'CONFIG_KSU_MULTI_MANAGER_SUPPORT=n' "$DF" >/dev/null || { echo "MISSING multi-manager config"; exit 1; }
           if grep -F 'CONFIG_KSU_FULL_NAME_FORMAT' "$DF" >/dev/null; then
             echo "no-ver-edit FAILED: version format still present"; exit 1
           fi

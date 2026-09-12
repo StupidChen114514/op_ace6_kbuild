@@ -449,6 +449,8 @@ def main(argv=None):
         append_defconfig(kernel_common, ["CONFIG_BBG=y"])
         ensure_lsm_in_defconfig(kernel_common, lsm="baseband_guard")
     if args.mountify:
+        # 注：mountify 的真实内核 CONFIG 符号未能从公开源码确认（可能在 KernelSU 变体内建/运行时模块），
+        # 此处为未验证的自猜名；Kconfig 对未知符号会忽略，功能本身取决于 mountify 的加载方式。
         append_defconfig(kernel_common, ["CONFIG_KSU_MOUNTIFY=y"])
         log("Mountify enabled")
     if args.fengchi:
@@ -461,7 +463,7 @@ def main(argv=None):
         except Exception as e:
             log(f"warning: fengchi 补丁失败: {e}")
     if args.droidspace:
-        append_defconfig(kernel_common, ["CONFIG_DROIDSPACE=y"])
+        # droidspace.patch 不定义任何 CONFIG 符号（纯 overlayfs/vfs/tcp 修复），仅应用补丁
         try:
             d = os.path.join(patches_dir, "droidspace.patch")
             download(PATCH_DROIDSPACE, d)
@@ -469,7 +471,8 @@ def main(argv=None):
         except Exception as e:
             log(f"warning: droidspace 补丁失败: {e}")
     if args.ntsync:
-        append_defconfig(kernel_common, ["CONFIG_NT_SYNC=y"])
+        # 真实符号：CONFIG_NTSYNC（由 ntsync_compat 补丁在 drivers/misc/Kconfig 定义 config NTSYNC）
+        append_defconfig(kernel_common, ["CONFIG_NTSYNC=y"])
         try:
             b = os.path.join(patches_dir, "ntsync_base.patch")
             c = os.path.join(patches_dir, "ntsync_compat.patch")
