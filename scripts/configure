@@ -449,9 +449,10 @@ def main(argv=None):
         append_defconfig(kernel_common, ["CONFIG_BBG=y"])
         ensure_lsm_in_defconfig(kernel_common, lsm="baseband_guard")
     if args.mountify:
-        # 注：mountify 的真实内核 CONFIG 符号未能从公开源码确认（可能在 KernelSU 变体内建/运行时模块），
-        # 此处为未验证的自猜名；Kconfig 对未知符号会忽略，功能本身取决于 mountify 的加载方式。
-        append_defconfig(kernel_common, ["CONFIG_KSU_MOUNTIFY=y"])
+        # mountify = backslashxx/mountify（KSU metamodule，OverlayFS 运行时挂载隐藏，非内核补丁）。
+        # 其 README 要求 CONFIG_OVERLAY_FS=y（必需）+ CONFIG_TMPFS_XATTR=y（强烈建议），
+        # 安装时 customize.sh 会据此校验；不需要也不存在 CONFIG_KSU_MOUNTIFY。
+        append_defconfig(kernel_common, ["CONFIG_OVERLAY_FS=y", "CONFIG_TMPFS_XATTR=y"])
         log("Mountify enabled")
     if args.fengchi:
         src = PATCH_FENGCHI_118 if kver == "6.6.118" else PATCH_FENGCHI_89
