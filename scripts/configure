@@ -158,6 +158,38 @@ def sed_file(pattern, replacement, path):
     sh(["sed", "-i", f"s/{pattern}/{replacement}/", path])
 
 
+def ensure_lsm_in_defconfig(kernel_common, lsm="baseband_guard",
+                            defconfig_rel="arch/arm64/configs/gki_defconfig"):
+    """确保 defconfig 的 CONFIG_LSM 包含指定的 LSM（BBG 集成要求）。
+
+    security/baseband-guard/Makefile 在 HAS_DEFINE_LSM 的内核（GKI）上，
+    要求 CONFIG_LSM 值里含 baseband_guard，否则构建直接 abort。
+    这步对齐原闭源二进制的自动集成，补上 bbg/setup.sh 提示的手动步骤。
+    """
+    df = os.path.join(kernel_common, defconfig_rel)
+    if not os.path.isfile(df):
+        log(f"warning: defconfig 不存在，跳过 CONFIG_LSM 处理: {df}")
+        return
+    with open(df) as f:
+        raw = f.read()
+    found = False
+    for line in raw.splitlines():
+        if line.startswith("CONFIG_LSM="):
+            found = True
+            val = line[len("CONFIG_LSM="):]
+            if lsm in [x.strip() for x in val.split(",")]:
+                log(f"CONFIG_LSM 已包含 {lsm}")
+            else:
+                new_val = f"{val},{lsm}" if val else lsm
+                raw = raw.replace(line, f"CONFIG_LSM={new_val}", 1)
+                log(f"CONFIG_LSM 追加 {lsm}: CONFIG_LSM={new_val}")
+            break
+    if not found:
+        log(f"warning: 未找到 CONFIG_LSM 行，无法追加 {lsm}")
+    with open(df, "w") as f:
+        f.write(raw)
+
+
 # ----------------------------------------------------------------------------
 # 等价脚本主体
 # ----------------------------------------------------------------------------
@@ -332,6 +364,11 @@ def main(argv=None):
                 sh(["bash", bb_setup], cwd=kernel_common)
         except Exception as e:
             log(f"warning: BBG 安装失败: {e}")
+        # bbg/setup.sh 只提示"手动设置 defconfig"；原闭源二进制会自动完成。
+        # 这里做等价自动集成：启用 CONFIG_BBG 并把 baseband_guard 追加进 CONFIG_LSM，
+        # 否则 HAS_DEFINE_LSM（GKI）内核会在 security/baseband-guard/Makefile 直接 abort。
+        append_defconfig(kernel_common, ["CONFIG_BBG=y"])
+        ensure_lsm_in_defconfig(kernel_common, lsm="baseband_guard")
     if args.mountify:
         append_defconfig(kernel_common, ["CONFIG_KSU_MOUNTIFY=y"])
         log("Mountify enabled")

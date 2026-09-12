@@ -28,7 +28,8 @@ jobs:
           mkdir -p /tmp/mock/kernel_workspace/kernel_platform/common/arch/arm64/lib
           printf 'VERSION = 6\nPATCHLEVEL = 6\nSUBLEVEL = 89\nNAME = mock\n' \
             > /tmp/mock/kernel_workspace/kernel_platform/common/Makefile
-          printf 'CONFIG_ZRAM=m\nCONFIG_FOO=y\n' \
+          # 预置 CONFIG_LSM，用于断言 BBG 自动集成（baseband_guard 追加）
+          printf 'CONFIG_LSM=landlock,lockdown,yama,safesetid,bpf\nCONFIG_ZRAM=m\nCONFIG_FOO=y\n' \
             > /tmp/mock/kernel_workspace/kernel_platform/common/arch/arm64/configs/gki_defconfig
 
       # configure 会尝试真实 git clone / curl；本测试只关心 configure 自身逻辑
@@ -41,13 +42,13 @@ jobs:
           printf '#!/bin/bash\nexit 0\n' > /tmp/mockbin/curl
           chmod +x /tmp/mockbin/git /tmp/mockbin/curl
 
-      - name: Run configure (RESUKISU + SUSFS + ZRAM LZ4 + mountify)
+      - name: Run configure (RESUKISU + SUSFS + ZRAM LZ4 + mountify + BBG)
         run: |
           export PATH="/tmp/mockbin:$PATH"
           cd /tmp/mock/kernel_workspace
           cp "$GITHUB_WORKSPACE/repo/scripts/configure" ./configure
           chmod +x ./configure
-          ./configure --ksu-variant RESUKISU --ksu-branch default --susfs --zram LZ4 --mountify
+          ./configure --ksu-variant RESUKISU --ksu-branch default --susfs --with-bbg --zram LZ4 --mountify
 
       - name: Assert config output
         run: |
@@ -58,6 +59,8 @@ jobs:
               'CONFIG_ZRAM=y' \
               'CONFIG_ZRAM_WRITEBACK=y' \
               'CONFIG_KSU_MOUNTIFY=y' \
+              'CONFIG_BBG=y' \
+              'CONFIG_LSM=landlock,lockdown,yama,safesetid,bpf,baseband_guard' \
               'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@%REPO_NAME%"' ; do
             grep -F "$pat" "$DF" >/dev/null || { echo "MISSING in defconfig: $pat"; exit 1; }
           done
@@ -65,6 +68,7 @@ jobs:
           grep -F 'ZRAM Option: LZ4' "$S" >/dev/null || { echo "missing ZRAM summary"; exit 1; }
           grep -F 'Kernel Version: 6.6.89' "$S" >/dev/null || { echo "missing kernel version summary"; exit 1; }
           grep -F 'Mountify Support: Enabled' "$S" >/dev/null || { echo "missing Mountify summary"; exit 1; }
+          grep -F 'Baseband_guard Support: Enabled' "$S" >/dev/null || { echo "missing BBG summary"; exit 1; }
           echo "ALL ASSERTIONS PASSED"
 
       - name: Run configure (SUKISU + KPM + disable multi-manager + no-ver-edit)
