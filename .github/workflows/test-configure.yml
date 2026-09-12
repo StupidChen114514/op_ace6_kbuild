@@ -28,8 +28,9 @@ jobs:
           mkdir -p /tmp/mock/kernel_workspace/kernel_platform/common/arch/arm64/lib
           printf 'VERSION = 6\nPATCHLEVEL = 6\nSUBLEVEL = 89\nNAME = mock\n' \
             > /tmp/mock/kernel_workspace/kernel_platform/common/Makefile
-          # 预置 CONFIG_LSM，用于断言 BBG 自动集成（baseband_guard 追加）
-          printf 'CONFIG_LSM=landlock,lockdown,yama,safesetid,bpf\nCONFIG_ZRAM=m\nCONFIG_FOO=y\n' \
+          # 真实 gki_defconfig 没有 CONFIG_LSM 行（值来自 Kconfig 默认），
+          # 断言 configure 的 BBG 自动集成会新增完整 CONFIG_LSM 集 + baseband_guard
+          printf 'CONFIG_ZRAM=m\nCONFIG_FOO=y\n' \
             > /tmp/mock/kernel_workspace/kernel_platform/common/arch/arm64/configs/gki_defconfig
 
       # configure 会尝试真实 git clone / curl；本测试只关心 configure 自身逻辑
@@ -60,7 +61,7 @@ jobs:
               'CONFIG_ZRAM_WRITEBACK=y' \
               'CONFIG_KSU_MOUNTIFY=y' \
               'CONFIG_BBG=y' \
-              'CONFIG_LSM=landlock,lockdown,yama,safesetid,bpf,baseband_guard' \
+              'CONFIG_LSM=landlock,lockdown,yama,loadpin,safesetid,selinux,smack,tomoyo,apparmor,bpf,baseband_guard' \
               'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@%REPO_NAME%"' ; do
             grep -F "$pat" "$DF" >/dev/null || { echo "MISSING in defconfig: $pat"; exit 1; }
           done

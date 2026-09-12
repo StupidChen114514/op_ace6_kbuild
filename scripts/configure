@@ -82,6 +82,10 @@ CONFIG_KSU_SUSFS_N  = "CONFIG_KSU_SUSFS=n"
 CONFIG_KSU_HOOK_N   = "CONFIG_KSU_KPROBES_HOOK=n"
 CONFIG_KSU_FMT      = 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@%REPO_NAME%"'
 
+# gki_defconfig 缺省没有 CONFIG_LSM 行时，新增用到的完整 LSM 集
+# （对齐构建时内核实际默认：landlock,...,bpf；BBG 追加最后）+ baseband_guard
+_BBG_DEFAULT_LSM = "landlock,lockdown,yama,loadpin,safesetid,selinux,smack,tomoyo,apparmor,bpf"
+
 
 # ----------------------------------------------------------------------------
 # 工具函数
@@ -185,7 +189,12 @@ def ensure_lsm_in_defconfig(kernel_common, lsm="baseband_guard",
                 log(f"CONFIG_LSM 追加 {lsm}: CONFIG_LSM={new_val}")
             break
     if not found:
-        log(f"warning: 未找到 CONFIG_LSM 行，无法追加 {lsm}")
+        # 真实 gki_defconfig 通常没有 CONFIG_LSM 行（值来自 Kconfig 默认）。
+        # 此时新增完整行：取内核实际默认 LSM 集（对齐构建时的 CONFIG_LSM 值）
+        # + baseband_guard，等价于 bbg/setup.sh 提示的"手动 select one append"。
+        full = f"{_BBG_DEFAULT_LSM},{lsm}"
+        raw = raw.rstrip("\n") + f"\nCONFIG_LSM={full}\n"
+        log(f"CONFIG_LSM 新增 {lsm}: CONFIG_LSM={full}")
     with open(df, "w") as f:
         f.write(raw)
 
