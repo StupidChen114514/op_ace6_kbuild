@@ -47,9 +47,13 @@ KSU_VARIANTS = {
                  "susfs_intregated": "manual"},
 }
 
-# SUSFS 仓库来源：按内核版本分流（6.6.89 -> luyanci/susfs4oki；其余 -> simonpunk/susfs4ksu）
+# SUSFS 仓库来源：按内核版本分流（对齐原版二进制日志 + ResukiSU 兼容性）。
+# 注意：ResukiSU 的 kernel/hook/setuid_hook.c 依赖 susfs_*_no_su 系列
+# (static inline 于 kernel_patches/include/linux/susfs_def.h)，
+# 只有 simonpunk/susfs4ksu 提供；luyanci/susfs4oki 缺失这些 API。
+# 因此 6.6.89 的 RESUKISU 集成分支也用 susfs4ksu（原版日志实证 clone susfs4ksu）。
 SUSFS_REPO_BY_KERNEL = {
-    "6.6.89":  {"repo": "luyanci/susfs4oki",   "branch": "oki-android15-6.6", "host": "github.com"},
+    "6.6.89":  {"repo": "simonpunk/susfs4ksu", "branch": "gki-android15-6.6", "host": "gitlab.com"},
     "6.6.118": {"repo": "simonpunk/susfs4ksu", "branch": "gki-android15-6.6", "host": "gitlab.com"},
 }
 SUSFS_REPO_DEFAULT = "6.6.118"
@@ -112,6 +116,41 @@ def download(url, dest, cwd=None):
 
 def git_clone(repo_url, branch, dest, cwd=None):
     sh(["git", "clone", repo_url, "-b", branch, dest, "--depth=1"], cwd=cwd)
+
+
+def copy_dir_contents(src_dir, dst_dir):
+    """把 src_dir 下的所有条目复制到 dst_dir（递归，加法合并）。"""
+    if not os.path.isdir(src_dir) or not os.path.isdir(dst_dir):
+        log(f"warning: 目录缺失，跳过复制 {src_dir} -> {dst_dir}")
+        return
+    for name in os.listdir(src_dir):
+        sp = os.path.join(src_dir, name)
+        dp = os.path.join(dst_dir, name)
+        if os.path.isdir(sp):
+            os.makedirs(dp, exist_ok=True)
+            copy_dir_contents(sp, dp)
+        else:
+            sh(["cp", "-f", sp, dp])
+
+
+def apply_susfs_enable_patch(susfs_dir, kernel_common):
+    """应用 susfs 仓库里把 susfs 接进内核编译的 enable 补丁（50_*.patch）。
+
+    kernel_patches/ 下形如 `50_add_susfs_in_gki-android15-6.6.patch`，
+    会把 fs/susfs.c 挂进 fs/Makefile、给各 fs/*.c 加 CONFIG_KSU_SUSFS 钩子。
+    对齐原版二进制的 `apply 50_enable_susfs_for_kernel.patch`。
+    """
+    kp = os.path.join(susfs_dir, "kernel_patches")
+    if not os.path.isdir(kp):
+        log("warning: susfs kernel_patches 目录不存在，跳过 enable 补丁")
+        return False
+    for name in sorted(os.listdir(kp)):
+        if name.startswith("50_") and name.endswith(".patch"):
+            apply_patch(os.path.join(kp, name), cwd=kernel_common)
+            log(f"SUSFS enable 补丁应用: {name}")
+            return True
+    log("warning: 未找到 susfs 50_*.patch，SUSFS 未接线进编译")
+    return False
 
 
 def apply_patch(patch, strip=1, cwd=None):
@@ -280,35 +319,28 @@ def main(argv=None):
         susfs_cfg = SUSFS_REPO_BY_KERNEL.get(kver, SUSFS_REPO_BY_KERNEL[SUSFS_REPO_DEFAULT])
         host = susfs_cfg["host"]
         susfs_repo_url = f"https://{host}/{susfs_cfg['repo']}.git"
-        integrated = vinfo.get("susfs_intregated") == "manual" or variant in ("NEXT",)
-        if integrated:
-            # 走"集成分支"路径：直接 checkout 变体/内核版本对应的 SUSFS 分支集成
-            log("SUSFS: integration available for this variant. Using integrated branch for setup.")
+        try:
             susfs_dir = os.path.join(base, "SUSFS")
             git_clone(susfs_repo_url, susfs_cfg["branch"], susfs_dir, cwd=base)
-            # 将 SUSFS 结构与配置并入内核（保守：拷贝 fs/include if present + defconfig 切换）
-            for d in ("fs", "include"):
-                src = os.path.join(susfs_dir, d)
-                if os.path.isdir(src):
-                    sh(["cp", "-r", src, kernel_common])
+            # 1) 把 susfs 源码与头文件并入内核树（kernel_patches/fs、kernel_patches/include）
+            #    这提供 fs/susfs.c 和 include/linux/{susfs.h,susfs_def.h}，
+            #    其中 susfs_def.h 定义了 ResukiSU 依赖的 susfs_*_no_su 等 static inline。
+            copy_dir_contents(os.path.join(susfs_dir, "kernel_patches", "fs"),
+                              os.path.join(kernel_common, "fs"))
+            copy_dir_contents(os.path.join(susfs_dir, "kernel_patches", "include"),
+                              os.path.join(kernel_common, "include"))
+            # 2) 应用 enable 补丁（50_*.patch）：接线 fs/Makefile + 各 fs/*.c 钩子
+            apply_susfs_enable_patch(susfs_dir, kernel_common)
+            # 3) KernelSU 侧 susfs 兼容补丁若存在则一并应用（对齐原版手动链）
+            ksu_patch = os.path.join(susfs_dir, "kernel_patches", "KernelSU",
+                                     "10_enable_susfs_for_ksu.patch")
+            if os.path.isfile(ksu_patch):
+                apply_patch(ksu_patch, cwd=kernel_common)
+            # 4) defconfig 启用 SUSFS 钩子
             append_defconfig(kernel_common, [CONFIG_KSU_SUSFS_Y])
-            log(f"SUSFS integrated (variant={variant})")
-        else:
-            # 需手动打补丁路径（行为基线 §4 手动链）
-            log("SUSFS: integration requires manual patching for this variant. Using standard branch.")
-            susfs_dir = os.path.join(base, "SUSFS")
-            git_clone(susfs_repo_url, susfs_cfg["branch"], susfs_dir, cwd=base)
-            for sub in ("kernel_patches", ""):
-                base_p = os.path.join(susfs_dir, sub)
-                if os.path.isfile(os.path.join(base_p, "10_enable_susfs_for_ksu.patch")):
-                    apply_patch(os.path.join(base_p, "10_enable_susfs_for_ksu.patch"), cwd=kernel_common)
-                    break
-            for d in ("fs", "include"):
-                src = os.path.join(susfs_dir, d)
-                if os.path.isdir(src):
-                    sh(["cp", "-r", src, kernel_common])
-            append_defconfig(kernel_common, [CONFIG_KSU_SUSFS_Y])
-            log("SUSFS manually integrated")
+            log(f"SUSFS integrated (variant={variant}, repo={susfs_cfg['repo']})")
+        except Exception as e:
+            log(f"error: SUSFS 集成失败: {e}")
     else:
         append_defconfig(kernel_common, [CONFIG_KSU_SUSFS_N, CONFIG_KSU_HOOK_N])
 
