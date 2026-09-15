@@ -1,181 +1,337 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-configure — 开源等价脚本，替代原闭源 `scripts/configure`。
+configure v2 — OnePlus Ace6 内核构建配置器（开源）
 
-行为依据：`.trae/specs/replace-closed-configure/behavior-baseline.md`
-（对原 UPX/Nuitka onefile 闭源二进制的反编译行为基线）。
+替代原闭源 `scripts/configure`（UPX/Nuitka 黑盒）。本版基于 2026-09-15 的实测结论重写：
 
-与原闭源二进制的关键差异：
-  - 完全开源、可审计，移除一切白名单/黑名单 GitHub 远程访问控制逻辑。
-  - 所有功能由本地命令行开关驱动，不依赖任何远程授权/封禁。
-  - 与现有 `.github/workflows/build-custom.yml` 的参数接口保持一致。
+行为与来源（均已实测验证）：
+  - KSU 变体：clone 对应仓库并执行其 kernel/setup.sh；ReSukiSU 系列的 SUSFS 支持内置，
+    不需要（且当前版本也打不上）KernelSU 侧 10_ 补丁。
+  - SUSFS 内核侧补丁：统一用 simonpunk/susfs4ksu（gitlab, 分支 gki-android15-6.6）：
+      * 6.6.118 : 补丁可 100% 干净应用；
+      * 6.6.89  : -F2 应用（1 处 include hunk 带模糊）+ `patches/89-susfs-fixup.patch`
+                  修补唯一残留的 fs/proc/base.c include hunk —— 已端到端验证 0 残留。
+  - 关键步骤硬失败：SUSFS / KSU / BBG / defconfig 写入任一失败 → 退出码非 0
+    （可选 --allow-degraded 降级为警告，仅用于排障）。
+  - 版本钉死：读取 pins.env（含上游 commit SHA，置空=跟踪上游最新），并在构建产物里
+    生成 build_manifest.txt（记录实际解析到的 SHA 与每个补丁的应用结果）。
+  - 修复了上一版的 3 个缺陷：10_ 补丁目录错误、hookless/zram URL 404、异常吞没（静默降级）。
 
-依赖：仅 Python 3 标准库 + 系统自带 `git` / `curl` / `patch` / `sed`。
-运行约定：在工作流中该脚本被拷贝到 `kernel_workspace/` 并在该目录执行，
-  内核树位于 `kernel_platform/common`。
+依赖：仅 Python3 标准库 + git / patch / sed（curl 不再需要）。
+运行约定：在工作流里被拷贝到 kernel_workspace/ 并从该目录执行，内核树位于
+  kernel_platform/common；patches/ 与 pins.env 会被一同拷贝到工作目录。
+
+退出码：0 成功（可能含已记录的可选功能降级）；非 0 = 关键步骤失败。
 """
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
+import tarfile
+import urllib.request
 
-# ----------------------------------------------------------------------------
-# 常量 / 表（对齐行为基线）
-# ----------------------------------------------------------------------------
+CONFIGURE_VERSION = "2.0.0"
 
-DESCRIPTION = "The configure of Kernel for Oneplus Ace 6."
+DESCRIPTION = "The configure of Kernel for Oneplus Ace 6 (open-source)."
 
-# KSU 变体 -> 其 KernelSU 仓库的 kernel/setup.sh 定位与默认分支。
-# 字段: repo_short "owner/repo", setup_rel "kernel/setup.sh", branch,
-#       method (SUSFS 集成方式: builtin/manual), susfs_branch(集成分支时用)
+# ---------------------------------------------------------------------------
+# 默认钉死值（可被 pins.env / 同名环境变量覆盖；SHA 置空 = 跟踪分支最新）
+# ---------------------------------------------------------------------------
+DEFAULT_PINS = {
+    # KernelSU
+    "KSU_REPO": "ReSukiSU/ReSukiSU",
+    "KSU_REF": "",                     # 例：v4.2.0-rc2 或 40 位 SHA；空 = main 最新
+    # SUSFS（gitlab simonpunk/susfs4ksu）
+    "SUSFS_HOST": "gitlab.com",
+    "SUSFS_REPO": "simonpunk/susfs4ksu",
+    "SUSFS_BRANCH": "gki-android15-6.6",
+    "SUSFS_SHA": "01677642e6ade3b9e56e0a8660192a664dad79e9",
+    # 通用补丁仓库 luyancib-org/kernel_patches
+    "KERNEL_PATCHES_REPO": "luyancib-org/kernel_patches",
+    "KERNEL_PATCHES_SHA": "3e36443e8b31b90c5aa8b1aa0d0250ad259bfd97",
+    # ZRAM LZ4 补丁（cctv18/oppo_oplus_realme_sm8750）
+    "ZRAM_PATCH_REPO": "cctv18/oppo_oplus_realme_sm8750",
+    "ZRAM_PATCH_SHA": "21db9e7d547ca625bd5aa734fb5dfc8b94ea48ef",
+    # Baseband-guard
+    "BBG_REPO": "vc-teahouse/Baseband-guard",
+    "BBG_REF": "",                     # 空 = main
+    # NTSync 补丁
+    "NTSC_REPO": "Goldzxcbug/Droidspaces_Kernel_patch",
+    "NTSC_SHA": "d8bf6769d0d5781d17701625a4dd8de42267768d",
+    # 其它杂项补丁仓库
+    "SUKI_HOOKS_REPO": "SukiSU-Ultra/SukiSU_patch",
+}
+
+# KSU 变体表：repo=KernelSU 仓库；branch=默认分支；
+# manual_susfs=True 表示该变体需要手动应用 10_enable_susfs_for_ksu.patch（旧世代路径，未验证）。
 KSU_VARIANTS = {
-    "KSUTRA":   {"repo": "tiann/KernelSU",       "branch": "main",   "method": "manual"},
-    "default":  {"repo": "backslashxx/KernelSU", "branch": "master", "method": "manual"},
-    "KSU":      {"repo": "backslashxx/KernelSU", "branch": "master", "method": "manual"},
-    "XXKSU":    {"repo": "backslashxx/KernelSU", "branch": "master", "method": "manual"},
-    "MAMBOSU":  {"repo": "RapliVx/KernelSU",      "branch": "master", "method": "manual",
-                 "susfs_branch": "susfs-mambo-master"},
-    "SUKISU":   {"repo": "Sukisu-Ultra/Sukisu-Ultra", "branch": "main", "method": "builtin"},
-    "RESUKISU": {"repo": "ReSukiSU/ReSukiSU",       "branch": "main", "method": "manual",
-                 "susfs_intregated": "manual"},
-    "RKSU":     {"repo": "ReSukiSU/ReSukiSU",       "branch": "main", "method": "manual",
-                 "susfs_intregated": "manual"},
-    "NEXT":     {"repo": "KernelSU-Next/KernelSU-Next", "branch": "dev", "method": "manual",
-                 "susfs_branch": "dev-susfs",
-                 "susfs_intregated": "manual"},
+    "default":  {"repo": "backslashxx/KernelSU",        "branch": "master", "manual_susfs": True},
+    "KSU":      {"repo": "backslashxx/KernelSU",        "branch": "master", "manual_susfs": True},
+    "XXKSU":    {"repo": "backslashxx/KernelSU",        "branch": "master", "manual_susfs": True},
+    "MAMBOSU":  {"repo": "RapliVx/KernelSU",            "branch": "master", "manual_susfs": True},
+    "SUKISU":   {"repo": "SukiSU-Ultra/SukiSU-Ultra",   "branch": "main",   "manual_susfs": False},
+    "RESUKISU": {"repo": "ReSukiSU/ReSukiSU",           "branch": "main",   "manual_susfs": False},
+    "RKSU":     {"repo": "ReSukiSU/ReSukiSU",           "branch": "main",   "manual_susfs": False},
+    "NEXT":     {"repo": "KernelSU-Next/KernelSU-Next", "branch": "dev",    "manual_susfs": False},
 }
 
-# SUSFS 仓库来源：按内核版本分流（对齐 cctv18/oppo_oplus_realme_sm8750 对该 OnePlus 内核的实证做法）。
-# 该内核是 android_kernel_common_oneplus_sm8750（非 stock GKI），必须用 susfs4oki 的
-# oki-android15-6.6 分支，其 50_add_susfs_in_gki 补丁才能干净应用；
-# simonpunk/susfs4ksu 的补丁针对 stock GKI，打不上（fs/exec.c、fs/proc/base.c、sched.h 上下文不符）。
-SUSFS_REPO_BY_KERNEL = {
-    "6.6.89":  {"repo": "luyanci/susfs4oki", "branch": "oki-android15-6.6", "host": "github.com"},
-    "6.6.118": {"repo": "luyanci/susfs4oki", "branch": "oki-android15-6.6", "host": "github.com"},
+# SUSFS 应用规格（按内核版本）：fuzz=应用模糊度；fixup=需要追加的修补补丁文件名
+SUSFS_SPEC = {
+    "6.6.118": {"fuzz": 0, "fixup": None,                    "expected_rejects": set()},
+    "6.6.89":  {"fuzz": 2, "fixup": "89-susfs-fixup.patch",  "expected_rejects": {"fs/proc/base.c"}},
 }
-SUSFS_REPO_DEFAULT = "6.6.118"
 
-# KernelSU 集成所需的 sosfs 补丁链目录来源（公开仓库 kernel_patches 的 KernelSU 子目录）
-KSU_SUSFS_PATCH = "luyancib-org/kernel_patches"   # 10_enable_susfs_for_ksu.patch / 50_add_susfs_in_gki-android15-6.6.patch
+# SUSFS 完整性断言（镜像 ReSukiSU 的编译期 hook 检查，问题提前到 configure 阶段暴露）
+SUSFS_ASSERTS = [
+    ("fs/exec.c", "ksu_handle_execveat", 1),
+    ("fs/open.c", "ksu_handle_faccessat", 1),
+    ("fs/stat.c", "ksu_handle_stat", 1),
+    ("kernel/sys.c", "ksu_handle_setresuid", 1),
+    ("kernel/reboot.c", "ksu_handle_sys_reboot", 1),
+    ("fs/read_write.c", "ksu_handle_sys_read", 1),
+    ("drivers/input/input.c", "ksu_handle_input_handle_event", 1),
+    ("fs/exec.c", "#include <linux/susfs_def.h>", 1),
+    ("fs/proc/base.c", "#include <linux/susfs_def.h>", 1),
+]
 
-# 各可选功能补丁来源（行为基线 §7）
-PATCH_KERNEL_PATCHES = "https://github.com/luyancib-org/kernel_patches/raw/master/other"
-PATCH_CVE_2026_43499 = PATCH_KERNEL_PATCHES + "/fix-CVE-2026-43499.patch"
-PATCH_DISPLAY_118     = PATCH_KERNEL_PATCHES + "/fix_display_for_118.patch"
-PATCH_FENGCHI_89      = PATCH_KERNEL_PATCHES + "/fengchi_oneplus_ace_6_89.patch"
-PATCH_FENGCHI_118     = PATCH_KERNEL_PATCHES + "/fengchi_oneplus_ace_6_118.patch"
-PATCH_DROIDSPACE      = PATCH_KERNEL_PATCHES + "/droidspace.patch"
-PATCH_LZ4KD           = PATCH_KERNEL_PATCHES + "/lz4kd.patch"
-PATCH_ZRAM_LIB_118    = PATCH_KERNEL_PATCHES + "/lib-Update-zram-to-1.10.0-6.6.118.patch"
-PATCH_SCOPE_HOOKS     = PATCH_KERNEL_PATCHES + "/scope-miniminzed/scope-minnimized-hooks-v1.9.patch"
-PATCH_MANUAL_HOOK     = PATCH_KERNEL_PATCHES + "/manual_hook/kernel-gki.patch"
+STATE = {"degraded": [], "manifest": []}
 
-PATCH_NTSYNC_BASE     = "https://github.com/Goldzxcbug/Droidspaces_Kernel_patch/raw/main/NTsync/ntsync_base.patch"
-PATCH_NTSYNC_COMPAT   = "https://github.com/Goldzxcbug/Droidspaces_Kernel_patch/raw/main/NTsync/ntsync_compat_android15-6.6.patch"
-PATCH_SUKISU_HOOKS    = "https://github.com/SukiSU-Ultra/SukiSU_patch/raw/main/hooks/syscall_hooks.patch"
+# ---------------------------------------------------------------------------
+# 基础工具
+# ---------------------------------------------------------------------------
 
-BBG_SETUP             = "vc-teahouse/Baseband-guard/main/setup.sh"
-DROIDSPACE_ZRAM_REPO  = "cctv18/oppo_oplus_realme_sm8750"   # main/zram_patch/{001-lz4,...,lz4armv8.S}
-
-# KPM = KPatch-Next 后置 Image 补丁（参考 oppo_oplus_realme_sm8750 local/builder_*.sh）
-KPM_KPTOOLS = "https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kptools-linux"
-KPM_KPIMG   = "https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kpimg-linux"
-
-# gki_defconfig 追加的 CONFIG（保守、对齐基线可确认项；缺省为最简可用集）
-CONFIG_KSU_SUSFS_Y  = "CONFIG_KSU_SUSFS=y"
-CONFIG_KSU_SUSFS_N  = "CONFIG_KSU_SUSFS=n"
-CONFIG_KSU_HOOK_N   = "CONFIG_KSU_KPROBES_HOOK=n"
-CONFIG_KSU_FMT      = 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@%REPO_NAME%"'
-
-# gki_defconfig 缺省没有 CONFIG_LSM 行时，新增用到的完整 LSM 集
-# （对齐构建时内核实际默认：landlock,...,bpf；BBG 追加最后）+ baseband_guard
-_BBG_DEFAULT_LSM = "landlock,lockdown,yama,loadpin,safesetid,selinux,smack,tomoyo,apparmor,bpf"
-
-
-# ----------------------------------------------------------------------------
-# 工具函数
-# ----------------------------------------------------------------------------
 
 def log(msg):
-    print(f"[configure] {msg}")
+    print(f"[configure] {msg}", flush=True)
 
 
-def sh(cmd, cwd=None, check=True):
-    """执行命令并返回返回码。cmd 为 list。"""
+def fail(msg):
+    if ALLOW_DEGRADED:
+        warn(f"(degraded) {msg}")
+        return
+    log(f"[FATAL] {msg}")
+    log("Configuration aborted.")
+    sys.exit(1)
+
+
+def warn(msg):
+    log(f"[WARN] {msg}")
+    STATE["degraded"].append(msg)
+
+
+def manifest(line):
+    STATE["manifest"].append(line)
+    print(f"[manifest] {line}", flush=True)
+
+
+def run(cmd, cwd=None, check=True, capture=False):
     log("$ " + " ".join(cmd))
+    if capture:
+        p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True)
+        return p.returncode, p.stdout
     if check:
         subprocess.check_call(cmd, cwd=cwd)
+        return 0, ""
+    return subprocess.call(cmd, cwd=cwd), ""
+
+
+def read_text(path):
+    try:
+        return open(path, encoding="utf-8", errors="replace").read()
+    except (FileNotFoundError, IsADirectoryError):
+        return ""
+
+
+def grep_count(path, needle):
+    return read_text(path).count(needle)
+
+
+def os_download(url, dest):
+    log(f"download: {url}")
+    req = urllib.request.Request(url, headers={"User-Agent": f"op_ace6_configure/{CONFIGURE_VERSION}"})
+    with urllib.request.urlopen(req, timeout=180) as r, open(dest, "wb") as f:
+        shutil.copyfileobj(r, f)
+
+
+def raw_url(host, repo, ref, path):
+    if host == "gitlab.com":
+        return f"https://gitlab.com/{repo}/-/raw/{ref}/{path}"
+    return f"https://raw.githubusercontent.com/{repo}/{ref}/{path}"
+
+
+def fetch_source_tree(host, repo, branch, sha, dest, label):
+    """获取补丁源仓库快照（优先按 SHA 的 tarball；否则 clone 分支）。"""
+    if os.path.isdir(dest):
+        shutil.rmtree(dest)
+    ref = sha if sha else branch
+    if host == "gitlab.com":
+        tarball_url = f"https://gitlab.com/{repo}/-/archive/{ref}/source.tar.gz"
     else:
-        return subprocess.call(cmd, cwd=cwd)
-    return 0
+        tarball_url = f"https://codeload.github.com/{repo}/tar.gz/{ref}"
+    tmp_tar = dest + ".tgz"
+    try:
+        os_download(tarball_url, tmp_tar)
+        os.makedirs(dest, exist_ok=True)
+        with tarfile.open(tmp_tar, "r:gz") as t:
+            # 去掉顶层目录
+            members = t.getmembers()
+            top = members[0].name.split("/")[0] if members else None
+            safe_extract_members(t, dest, top)
+        manifest(f"{label}: fetched {host}/{repo}@{ref} (tarball)")
+        return dest
+    except Exception as e:  # noqa: BLE001
+        log(f"tarball fetch failed ({e}); falling back to git clone")
+    finally:
+        if os.path.isfile(tmp_tar):
+            try:
+                os.remove(tmp_tar)
+            except OSError:
+                pass
+    url = f"https://{host}/{repo}.git"
+    run(["git", "clone", "-q", "--depth=1", "--no-single-branch", "-b", branch, url, dest])
+    if sha:
+        rc, _ = run(["git", "fetch", "--depth=1", "origin", sha], cwd=dest, check=False, capture=True)
+        if rc != 0:
+            fail(f"{label}: 无法在该克隆中解析 SHA {sha}")
+        run(["git", "checkout", "-q", sha], cwd=dest)
+    manifest(f"{label}: fetched {host}/{repo}@{ref} (git clone)")
+    return dest
 
 
-def download(url, dest, cwd=None):
-    """用 curl 抓取补丁到 dest。"""
-    sh(["curl", "-LSs", url, "-o", dest], cwd=cwd)
+def safe_extract_members(tar, dest, top):
+    for m in tar.getmembers():
+        name = m.name.replace("\\", "/")
+        if name.startswith("/") or ".." in name.split("/"):
+            raise RuntimeError(f"unsafe tar member: {m.name}")
+        if top and name == top:
+            continue
+        if top and name.startswith(top + "/"):
+            m2 = m
+            m2.name = name[len(top) + 1:]
+            tar.extract(m2, dest)
+        elif not top:
+            tar.extract(m, dest)
 
 
-def git_clone(repo_url, branch, dest, cwd=None):
-    sh(["git", "clone", repo_url, "-b", branch, dest, "--depth=1"], cwd=cwd)
+def clone_kernelsu(repo, branch, ref, dest):
+    """克隆 KernelSU 变体仓库到 dest；ref 可为分支/标签/SHA。"""
+    if os.path.isdir(dest):
+        shutil.rmtree(dest)
+    url = f"https://github.com/{repo}.git"
+    if ref and len(ref) == 40 and all(c in "0123456789abcdef" for c in ref):
+        run(["git", "clone", "-q", "--depth=1", "--no-single-branch", url, dest])
+        rc, out = run(["git", "fetch", "--depth=1", "origin", ref], cwd=dest, check=False, capture=True)
+        if rc != 0:
+            fail(f"KernelSU: 无法解析 SHA {ref}\n{out[-500:]}")
+        run(["git", "checkout", "-q", ref], cwd=dest)
+    elif ref:
+        run(["git", "clone", "-q", "--depth=1", "--no-single-branch", "-b", ref, url, dest])
+    else:
+        run(["git", "clone", "-q", "--depth=1", "--no-single-branch", "-b", branch, url, dest])
+    rc, out = run(["git", "rev-parse", "HEAD"], cwd=dest, capture=True)
+    return out.strip()
 
 
-def copy_dir_contents(src_dir, dst_dir):
-    """把 src_dir 下的所有条目复制到 dst_dir（递归，加法合并）。"""
-    if not os.path.isdir(src_dir) or not os.path.isdir(dst_dir):
-        log(f"warning: 目录缺失，跳过复制 {src_dir} -> {dst_dir}")
+# ---------------------------------------------------------------------------
+# 补丁应用（GNU patch；审计 .rej/.orig 移出树，不删除）
+# ---------------------------------------------------------------------------
+
+
+def apply_with_harvest(patch_path, tree, fuzz, tag, audit_root, expect_clean=True):
+    """应用补丁。返回 (rc, rejects[以 .rej 为准], fuzz_count, output)。"""
+    log(f"apply patch: {os.path.basename(patch_path)} (fuzz={fuzz})")
+    rc, out = run(["patch", "-p1", "--batch", f"--fuzz={fuzz}", "--forward", "-i", patch_path],
+                  cwd=tree, check=False, capture=True)
+    fuzz_count = out.count("with fuzz")
+    rejects, artifacts, moved = [], [], []
+    for root, _dirs, files in os.walk(tree):
+        for f in files:
+            rel = os.path.relpath(os.path.join(root, f), tree).replace("\\", "/")
+            if f.endswith(".rej"):
+                rejects.append(rel[: -len(".rej")])  # 记录目标文件路径（不含 .rej）
+                moved.append(rel)
+            elif f.endswith(".orig"):
+                artifacts.append(rel[: -len(".orig")])
+                moved.append(rel)
+    if moved:
+        audit = os.path.join(audit_root, tag)
+        os.makedirs(audit, exist_ok=True)
+        for rel in moved:
+            src = os.path.join(tree, rel)
+            dst = os.path.join(audit, rel.replace("/", "__"))
+            if os.path.isfile(src):
+                shutil.move(src, dst)
+        log(f"  -> rejects: {rejects or 'none'} | fuzz backups: {len(artifacts)} moved to audit/{tag}/")
+    if out.strip():
+        tail = "\n".join(out.strip().splitlines()[-5:])
+        log("  patch output tail:\n    " + tail.replace("\n", "\n    "))
+    return rc, rejects, fuzz_count, out
+
+
+# ---------------------------------------------------------------------------
+# defconfig / 杂项
+# ---------------------------------------------------------------------------
+
+
+def append_defconfig(kernel_common, lines, marker):
+    df = os.path.join(kernel_common, "arch/arm64/configs/gki_defconfig")
+    if not os.path.isfile(df):
+        fail(f"defconfig 不存在: {df}")
         return
-    for name in os.listdir(src_dir):
-        sp = os.path.join(src_dir, name)
-        dp = os.path.join(dst_dir, name)
-        if os.path.isdir(sp):
-            os.makedirs(dp, exist_ok=True)
-            copy_dir_contents(sp, dp)
-        else:
-            sh(["cp", "-f", sp, dp])
+    with open(df, "a", encoding="utf-8") as f:
+        f.write(f"\n# --- {marker} ---\n")
+        for ln in lines:
+            f.write(ln.rstrip() + "\n")
 
 
-def apply_susfs_enable_patch(susfs_dir, kernel_common):
-    """应用 susfs 仓库里把 susfs 接进内核编译的 enable 补丁（50_*.patch）。
+def ensure_lsm_in_defconfig(kernel_common):
+    """BBG 要求 CONFIG_LSM 含 baseband_guard；defconfig 无该行时新增完整行。"""
+    lsm = "baseband_guard"
+    default_lsm = "landlock,lockdown,yama,loadpin,safesetid,selinux,smack,tomoyo,apparmor,bpf"
+    df = os.path.join(kernel_common, "arch/arm64/configs/gki_defconfig")
+    if not os.path.isfile(df):
+        fail(f"defconfig 不存在: {df}")
+        return
+    raw = read_text(df)
+    found = False
+    out_lines = []
+    for line in raw.splitlines():
+        if line.startswith("CONFIG_LSM=") and not found:
+            found = True
+            val = line[len("CONFIG_LSM="):]
+            if lsm not in [x.strip() for x in val.split(",")]:
+                line = f"CONFIG_LSM={val},{lsm}" if val else f"CONFIG_LSM={lsm}"
+                log(f"CONFIG_LSM 追加 {lsm}: {line}")
+        out_lines.append(line)
+    if not found:
+        out_lines.append(f"CONFIG_LSM={default_lsm},{lsm}")
+        log(f"CONFIG_LSM 新增完整行: CONFIG_LSM={default_lsm},{lsm}")
+    with open(df, "w", encoding="utf-8") as f:
+        f.write("\n".join(out_lines) + "\n")
 
-    kernel_patches/ 下形如 `50_add_susfs_in_gki-android15-6.6.patch`，
-    会把 fs/susfs.c 挂进 fs/Makefile、给各 fs/*.c 加 CONFIG_KSU_SUSFS 钩子。
-    对齐原版二进制的 `apply 50_enable_susfs_for_kernel.patch`。
-    """
-    kp = os.path.join(susfs_dir, "kernel_patches")
-    if not os.path.isdir(kp):
-        log("warning: susfs kernel_patches 目录不存在，跳过 enable 补丁")
-        return False
-    for name in sorted(os.listdir(kp)):
-        if name.startswith("50_") and name.endswith(".patch"):
-            apply_patch(os.path.join(kp, name), cwd=kernel_common)
-            log(f"SUSFS enable 补丁应用: {name}")
-            return True
-    log("warning: 未找到 susfs 50_*.patch，SUSFS 未接线进编译")
-    return False
 
-
-def apply_patch(patch, strip=1, cwd=None):
-    """对内核树应用 git 格式补丁（支持 list 或路径）。"""
-    sh(["git", "apply", "-p%d" % strip, patch], cwd=cwd)
+def sed_file(pattern, replacement, path):
+    run(["sed", "-i", f"s/{pattern}/{replacement}/", path])
 
 
 def find_kernel_common(base):
-    """定位内核树根（kernel_platform/common）。"""
     cand = os.path.join(base, "kernel_platform", "common")
     if os.path.isdir(cand):
         return cand
     cand2 = os.path.join(base, "common")
     if os.path.isdir(cand2):
         return cand2
-    raise SystemExit(f"[configure] 无法定位内核树 kernel_platform/common under {base}")
+    fail(f"无法定位内核树 kernel_platform/common（cwd={base}）")
+    return None
 
 
 def get_kernel_version(kernel_common):
-    """从 Makefile 解析 VERSION.PATCHLEVEL.SUBLEVEL（行为基线 §patcher.get_kernel_versions）。"""
     ver = patch = sublev = ""
-    with open(os.path.join(kernel_common, "Makefile")) as f:
+    with open(os.path.join(kernel_common, "Makefile"), encoding="utf-8") as f:
         for line in f:
             s = line.strip()
             if s.startswith("VERSION"):
@@ -184,371 +340,489 @@ def get_kernel_version(kernel_common):
                 patch = s.split("=")[1].strip()
             elif s.startswith("SUBLEVEL"):
                 sublev = s.split("=")[1].strip()
-            elif s:
+            elif s and not s.startswith("#"):
                 break
     return f"{ver}.{patch}.{sublev}"
 
 
-def append_defconfig(kernel_common, lines, defconfig_rel="arch/arm64/configs/gki_defconfig"):
-    df = os.path.join(kernel_common, defconfig_rel)
-    if not os.path.isfile(df):
-        log(f"warning: defconfig 不存在，跳过追加: {df}")
-        return
-    with open(df, "a") as f:
-        f.write("\n# --- configure appended ---\n")
-        for ln in lines:
-            f.write(ln.strip() + "\n")
+def find_patches_dir(script_dir, cwd):
+    for cand in (os.path.join(cwd, "patches"),
+                 os.path.join(script_dir, "patches"),
+                 os.path.join(script_dir, "..", "patches")):
+        if os.path.isdir(cand):
+            return os.path.abspath(cand)
+    return None
 
 
-def sed_file(pattern, replacement, path):
-    sh(["sed", "-i", f"s/{pattern}/{replacement}/", path])
-
-
-def ensure_lsm_in_defconfig(kernel_common, lsm="baseband_guard",
-                            defconfig_rel="arch/arm64/configs/gki_defconfig"):
-    """确保 defconfig 的 CONFIG_LSM 包含指定的 LSM（BBG 集成要求）。
-
-    security/baseband-guard/Makefile 在 HAS_DEFINE_LSM 的内核（GKI）上，
-    要求 CONFIG_LSM 值里含 baseband_guard，否则构建直接 abort。
-    这步对齐原闭源二进制的自动集成，补上 bbg/setup.sh 提示的手动步骤。
-    """
-    df = os.path.join(kernel_common, defconfig_rel)
-    if not os.path.isfile(df):
-        log(f"warning: defconfig 不存在，跳过 CONFIG_LSM 处理: {df}")
-        return
-    with open(df) as f:
-        raw = f.read()
-    found = False
-    for line in raw.splitlines():
-        if line.startswith("CONFIG_LSM="):
-            found = True
-            val = line[len("CONFIG_LSM="):]
-            if lsm in [x.strip() for x in val.split(",")]:
-                log(f"CONFIG_LSM 已包含 {lsm}")
-            else:
-                new_val = f"{val},{lsm}" if val else lsm
-                raw = raw.replace(line, f"CONFIG_LSM={new_val}", 1)
-                log(f"CONFIG_LSM 追加 {lsm}: CONFIG_LSM={new_val}")
+def load_pins(script_dir, cwd):
+    pins = dict(DEFAULT_PINS)
+    for cand in (os.path.join(cwd, "pins.env"),
+                 os.path.join(script_dir, "pins.env"),
+                 os.path.join(script_dir, "..", "pins.env")):
+        if os.path.isfile(cand):
+            log(f"pins loaded: {cand}")
+            for line in open(cand, encoding="utf-8"):
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                pins[k.strip()] = v.strip()
             break
-    if not found:
-        # 真实 gki_defconfig 通常没有 CONFIG_LSM 行（值来自 Kconfig 默认）。
-        # 此时新增完整行：取内核实际默认 LSM 集（对齐构建时的 CONFIG_LSM 值）
-        # + baseband_guard，等价于 bbg/setup.sh 提示的"手动 select one append"。
-        full = f"{_BBG_DEFAULT_LSM},{lsm}"
-        raw = raw.rstrip("\n") + f"\nCONFIG_LSM={full}\n"
-        log(f"CONFIG_LSM 新增 {lsm}: CONFIG_LSM={full}")
-    with open(df, "w") as f:
-        f.write(raw)
+    for k in list(pins):
+        if os.environ.get(k):
+            pins[k] = os.environ[k]
+    return pins
 
 
-# ----------------------------------------------------------------------------
-# 等价脚本主体
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
+
 
 def build_parser():
     p = argparse.ArgumentParser(description=DESCRIPTION)
-    variants = list(KSU_VARIANTS.keys())
-    p.add_argument("--ksu-variant", default="default", choices=variants,
+    p.add_argument("--ksu-variant", default="default", choices=list(KSU_VARIANTS.keys()),
                    help="Set KernelSU variant")
     p.add_argument("--ksu-branch", default="default",
-                   help="Set the branch of KernelSU to use (default: default)")
+                   help="Set the branch/tag/SHA of KernelSU to use (default: default)")
     p.add_argument("--susfs", action="store_true", help="Enable SUSFS support")
     p.add_argument("--with-bbg", action="store_true", help="Enable Baseband_guard support")
     p.add_argument("--mountify", action="store_true", help="Enable Mountify module support")
     p.add_argument("--fengchi", action="store_true", help="Setup fengchi patch")
-    p.add_argument("--no-ver-edit", action="store_true",
-                   help="Disable version edit in gki_defconfig")
+    p.add_argument("--no-ver-edit", action="store_true", help="Disable version edit in gki_defconfig")
     p.add_argument("--kpm", action="store_true", help="Enable KPM module support (SukiSU only)")
-    p.add_argument("--kpm-patch", default=None,
-                   help="Path to Image that needs to be patched with KPM (SukiSU only)")
+    p.add_argument("--kpm-patch", default=None, help="Path to Image that needs to be patched with KPM")
     p.add_argument("--multi-manager", action="store_false", default=True,
                    help="Disable Multi manager Support (ReSukiSU only)")
     p.add_argument("--droidspace", action="store_true", help="Enable Droidspace-OSS features")
     p.add_argument("--ntsync", action="store_true", help="Enable NTSync features")
     p.add_argument("--hookless", action="store_true", help="Enable Hookless features(ReSukiSU only)")
-    p.add_argument("--zram", default="DISABLE",
-                   choices=["DISABLE", "LZ4", "LZ4KD"],
+    p.add_argument("--zram", default="DISABLE", choices=["DISABLE", "LZ4", "LZ4KD"],
                    help="Upgrade ZRAM support")
+    p.add_argument("--dry-run", action="store_true",
+                   help="只校验环境并打印计划（不做任何网络/修改动作）")
+    p.add_argument("--allow-degraded", action="store_true",
+                   help="关键步骤失败时降级为警告（排障用，默认关闭）")
     return p
 
 
 def main(argv=None):
+    global ALLOW_DEGRADED
     args = build_parser().parse_args(argv)
+    ALLOW_DEGRADED = args.allow_degraded
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     base = os.getcwd()
+    log(f"configure v{CONFIGURE_VERSION} | cwd={base}")
+
     kernel_common = find_kernel_common(base)
     kver = get_kernel_version(kernel_common)
     variant = args.ksu_variant.upper()
-    vinfo = KSU_VARIANTS.get(variant) or KSU_VARIANTS.get("default")
+    vinfo = KSU_VARIANTS.get(variant) or KSU_VARIANTS["default"]
+    pins = load_pins(script_dir, base)
+    patches_dir = find_patches_dir(script_dir, base)
+    audit_root = os.path.join(base, "patch_audit")
 
-    log(f"Kernel version detected: {kver}")
-    log(f"KSU variant: {variant}, branch: {args.ksu_branch}")
+    log(f"kernel version: {kver} | variant: {variant} | patches dir: {patches_dir}")
+    manifest(f"configure v{CONFIGURE_VERSION} | kernel {kver} | variant {variant} | cwd {base}")
 
-    # ---- 1) 总是应用的 CVE / 显示修复补丁（行为基线 §4）----
-    patches_dir = os.path.join(base, "patches_download")
-    os.makedirs(patches_dir, exist_ok=True)
-    cve_patch = os.path.join(patches_dir, "fix-CVE-2026-43499.patch")
-    disp_patch = os.path.join(patches_dir, "fix_display_for_118.patch")
+    if args.dry_run:
+        log("[dry-run] 计划：")
+        log(f"  - CVE 补丁: {raw_url('github.com', pins['KERNEL_PATCHES_REPO'], pins['KERNEL_PATCHES_SHA'] or 'master', 'other/fix-CVE-2026-43499.patch')}")
+        log(f"  - KSU: {vinfo['repo']} ref={args.ksu_branch if args.ksu_branch != 'default' else (pins['KSU_REF'] or vinfo['branch'])}")
+        if args.susfs:
+            log(f"  - SUSFS: {pins['SUSFS_HOST']}/{pins['SUSFS_REPO']}@{pins['SUSFS_SHA'] or pins['SUSFS_BRANCH']} "
+                f"(spec={SUSFS_SPEC.get(kver, 'UNSUPPORTED')})")
+        log("[dry-run] 完成（未做任何修改）")
+        return 0
+
+    # ---- 1) 常驻补丁：CVE（+ 6.6.118 显示修复）----------------------------
+    pd = os.path.join(base, "patches_download")
+    os.makedirs(pd, exist_ok=True)
+    kp_ref = pins["KERNEL_PATCHES_SHA"] or "master"
+    kp_repo = pins["KERNEL_PATCHES_REPO"]
+
+    def kp_raw(path):
+        return raw_url("github.com", kp_repo, kp_ref, path)
+
+    cve = os.path.join(pd, "fix-CVE-2026-43499.patch")
     try:
-        download(PATCH_CVE_2026_43499, cve_patch)
-        apply_patch(cve_patch, cwd=kernel_common)
-        log("Applied fix-CVE-2026-43499.patch")
-    except Exception as e:
-        log(f"warning: CVE patch 应用失败（不影响后续功能）: {e}")
+        os_download(kp_raw("other/fix-CVE-2026-43499.patch"), cve)
+        rc, rejs, _fz, _o = apply_with_harvest(cve, kernel_common, 2, "cve", audit_root)
+        if rc != 0 or rejs:
+            warn(f"CVE 补丁未干净应用 (rc={rc}, rejects={rejs})")
+        else:
+            manifest("patch fix-CVE-2026-43499.patch -> OK")
+    except Exception as e:  # noqa: BLE001
+        warn(f"CVE 补丁获取/应用失败: {e}")
+
     if kver == "6.6.118":
+        disp = os.path.join(pd, "fix_display_for_118.patch")
         try:
-            download(PATCH_DISPLAY_118, disp_patch)
-            apply_patch(disp_patch, cwd=kernel_common)
-            log("Applied fix_display_for_118.patch")
-        except Exception as e:
-            log(f"warning: display patch 应用失败: {e}")
-    # 把 CVE/显示补丁落盘到内核树 root（对齐基线 §4/§5 "出现在 kernel_platform/common/ 下"）
-    for p, land_name in ((cve_patch, "fix_CVE_2026_43499.patch"),
-                         (disp_patch, "fix_display_for_118.patch")):
-        if os.path.isfile(p):
-            try:
-                sh(["cp", "-f", p, os.path.join(kernel_common, land_name)])
-            except Exception:
-                pass
-
-    # ---- 2) KSU 变体注入：clone 对应仓库并执行 kernel/setup.sh（行为基线 §2）----
-    ksu_dir = os.path.join(base, "KernelSU")
-    repo_url = f"https://github.com/{vinfo['repo']}.git"
-    # --ksu-branch 覆盖克隆分支；default 表示使用该变体的默认分支（对齐基线 §1）
-    branch = args.ksu_branch if args.ksu_branch != "default" else vinfo["branch"]
-    try:
-        git_clone(repo_url, branch, ksu_dir, cwd=base)
-        setup = os.path.join(ksu_dir, "kernel", "setup.sh")
-        if os.path.isfile(setup):
-            sh(["bash", setup], cwd=kernel_common)
-            log(f"Ran {vinfo['repo']} kernel/setup.sh")
-        else:
-            log(f"warning: setup.sh 不存在: {setup}")
-    except Exception as e:
-        log(f"error: KernelSU clone/setup 失败: {e}")
-
-    # ---- 3) SUSFS（行为基线 §3）----
-    if args.susfs:
-        # 变体专属 SUSFS 分支（MAMBOSU=susfs-mambo-master、NEXT=dev-susfs）：
-        # 从该变体自己的 KernelSU 仓库对应分支取 SUSFS；否则按内核版本用 susfs4ksu。
-        if vinfo.get("susfs_branch"):
-            susfs_repo_url = f"https://github.com/{vinfo['repo']}.git"
-            susfs_branch = vinfo["susfs_branch"]
-            susfs_log_repo = f"{vinfo['repo']}:{susfs_branch}"
-        else:
-            susfs_cfg = SUSFS_REPO_BY_KERNEL.get(kver, SUSFS_REPO_BY_KERNEL[SUSFS_REPO_DEFAULT])
-            susfs_repo_url = f"https://{susfs_cfg['host']}/{susfs_cfg['repo']}.git"
-            susfs_branch = susfs_cfg["branch"]
-            susfs_log_repo = susfs_cfg["repo"]
-        try:
-            susfs_dir = os.path.join(base, "SUSFS")
-            git_clone(susfs_repo_url, susfs_branch, susfs_dir, cwd=base)
-            # 1) 把 susfs 源码与头文件并入内核树（kernel_patches/fs、kernel_patches/include）
-            #    这提供 fs/susfs.c 和 include/linux/{susfs.h,susfs_def.h}，
-            #    其中 susfs_def.h 定义了 ResukiSU 依赖的 susfs_*_no_su 等 static inline。
-            copy_dir_contents(os.path.join(susfs_dir, "kernel_patches", "fs"),
-                              os.path.join(kernel_common, "fs"))
-            copy_dir_contents(os.path.join(susfs_dir, "kernel_patches", "include"),
-                              os.path.join(kernel_common, "include"))
-            # 2) 应用 enable 补丁（50_*.patch）：接线 fs/Makefile + 各 fs/*.c 钩子
-            apply_susfs_enable_patch(susfs_dir, kernel_common)
-            # 3) KernelSU 侧 susfs 兼容补丁若存在则一并应用（对齐原版手动链）
-            ksu_patch = os.path.join(susfs_dir, "kernel_patches", "KernelSU",
-                                     "10_enable_susfs_for_ksu.patch")
-            if os.path.isfile(ksu_patch):
-                apply_patch(ksu_patch, cwd=kernel_common)
-            # 4) defconfig 启用 SUSFS 钩子
-            append_defconfig(kernel_common, [CONFIG_KSU_SUSFS_Y])
-            log(f"SUSFS integrated (variant={variant}, repo={susfs_log_repo})")
-        except Exception as e:
-            log(f"error: SUSFS 集成失败: {e}")
-    else:
-        append_defconfig(kernel_common, [CONFIG_KSU_SUSFS_N, CONFIG_KSU_HOOK_N])
-
-    # ---- 4) KPM（KPatch-Next 后置 Image 补丁，参考 oppo_oplus_realme_sm8750）----
-    # 说明：KPM 不在编译期改 CONFIG_KPM / arch/arm64/Makefile，而是用 KPatch-Next 的
-    #       kptools-linux 对**已编译的 Image** 打补丁（把 kpimg-linux 并进内核镜像）。
-    #       configure 在此仅负责：下载工具 + （给了 --kpm-patch 时）对指定 Image 打补丁。
-    if args.kpm:
-        kptools = os.path.join(base, "kptools-linux")
-        kpimg = os.path.join(base, "kpimg-linux")
-        try:
-            download(KPM_KPTOOLS, kptools)
-            download(KPM_KPIMG, kpimg)
-            os.chmod(kptools, 0o755)
-            log("KPatch-Next kptools-linux / kpimg-linux downloaded")
-        except Exception as e:
-            log(f"warning: KPM 工具下载失败: {e}")
-        if args.kpm_patch:
-            img = os.path.abspath(args.kpm_patch)
-            if not os.path.isfile(img):
-                raise SystemExit(f"Image not found: {img}")
-            if os.path.basename(img) != "Image":
-                raise SystemExit(f"Image file name must be 'Image', got '{os.path.basename(img)}'")
-            if not os.path.isfile(kptools) or not os.access(kptools, os.X_OK):
-                log("warning: kptools-linux 缺失，跳过 KPM Image 补丁")
+            os_download(kp_raw("other/fix_display_for_118.patch"), disp)
+            rc, rejs, _fz, _o = apply_with_harvest(disp, kernel_common, 2, "display118", audit_root)
+            if rc != 0 or rejs:
+                warn(f"display118 补丁未干净应用 (rc={rc}, rejects={rejs})")
             else:
-                # 对齐参考：kptools-linux -p -i Image -k kpimg-linux -o oImage
-                out_img = img + ".kpm"
-                sh([kptools, "-p", "-i", img, "-k", kpimg, "-o", out_img], cwd=base)
-                os.replace(out_img, img)
-                log("KPM(Image) 补丁完成 (KPatch-Next)")
-        log("KPM enabled (KPatch-Next)")
+                manifest("patch fix_display_for_118.patch -> OK")
+        except Exception as e:  # noqa: BLE001
+            warn(f"display118 补丁获取/应用失败: {e}")
 
-    # ---- 5) ZRAM（行为基线 §5/§7）----
-    zram = args.zram.upper()
-    zram_cfg = []
-    if zram == "LZ4":
-        zram_cfg += ["CONFIG_ZRAM=y", "CONFIG_ZRAM_WRITEBACK=y"]
-        zram_repo = "https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8750/main/zram_patch"
-        try:
-            # 001-lz4：LZ4 使能补丁（基线 §7）
-            d1 = os.path.join(patches_dir, "001-lz4.patch")
-            download(f"{zram_repo}/001-lz4", d1)
-            apply_patch(d1, cwd=kernel_common)
-        except Exception as e:
-            log(f"warning: LZ4 001-lz4 补丁失败（继续拷贝 asm）: {e}")
-        try:
-            # lz4armv8.S：arm64 LZ4 实现
-            d = os.path.join(patches_dir, "zram_lz4armv8.S")
-            download(f"{zram_repo}/lz4armv8.S", d)
-            sh(["cp", d, os.path.join(kernel_common, "arch", "arm64", "lib")])
-        except Exception as e:
-            log(f"warning: LZ4 lz4armv8.S 下载/拷贝失败: {e}")
-    elif zram == "LZ4KD":
-        zram_cfg += ["CONFIG_ZRAM=y", "CONFIG_ZRAM_LZ4KD=y"]
-        try:
-            d = os.path.join(patches_dir, "lz4kd.patch")
-            download(PATCH_LZ4KD, d)
-            apply_patch(d, cwd=kernel_common)
-        except Exception as e:
-            log(f"warning: LZ4KD 补丁失败: {e}")
-    if zram in ("LZ4", "LZ4KD"):
-        # 基线 §7：6.6.118 需 upgrade zram 库到 1.10.0
-        if kver == "6.6.118":
-            try:
-                zup = os.path.join(patches_dir, "lib-update-zram-118.patch")
-                download(PATCH_ZRAM_LIB_118, zup)
-                apply_patch(zup, cwd=kernel_common)
-            except Exception as e:
-                log(f"warning: zram 库升级补丁失败: {e}")
-        append_defconfig(kernel_common, zram_cfg)
+    # ---- 2) KernelSU 变体注入 -------------------------------------------
+    ksu_ref = pins["KSU_REF"] if args.ksu_branch == "default" else args.ksu_branch
+    if variant in ("RESUKISU", "RKSU", "SUKISU", "NEXT"):
+        # 已验证路径：直接克隆到内核树内 KernelSU/，再执行其 setup.sh
+        ksu_dest = os.path.join(kernel_common, "KernelSU")
+        resolved = clone_kernelsu(vinfo["repo"], vinfo["branch"], ksu_ref, ksu_dest)
+        manifest(f"KSU {variant}: {vinfo['repo']} ref={ksu_ref or vinfo['branch']} resolved={resolved}")
+        setup = os.path.join(ksu_dest, "kernel", "setup.sh")
+        if not os.path.isfile(setup):
+            fail(f"KernelSU setup.sh 不存在: {setup}")
+        rc, out = run(["bash", "KernelSU/kernel/setup.sh", ksu_ref or vinfo["branch"]],
+                      cwd=kernel_common, check=False, capture=True)
+        if rc != 0:
+            fail(f"KernelSU setup.sh 失败 (rc={rc})\n{out[-1500:]}")
+        log("KernelSU setup.sh OK")
+    else:
+        # 旧世代变体：保持以往的"工作区克隆 + setup.sh"方式（best-effort）
+        ksu_dest = os.path.join(base, "KernelSU")
+        resolved = clone_kernelsu(vinfo["repo"], vinfo["branch"], ksu_ref, ksu_dest)
+        manifest(f"KSU {variant}: {vinfo['repo']} ref={ksu_ref or vinfo['branch']} resolved={resolved}")
+        setup = os.path.join(ksu_dest, "kernel", "setup.sh")
+        if os.path.isfile(setup):
+            rc, out = run(["bash", setup], cwd=kernel_common, check=False, capture=True)
+            if rc != 0:
+                warn(f"KernelSU setup.sh 失败 (rc={rc}) —— 该变体路径未经验证\n{out[-800:]}")
+        else:
+            warn(f"KernelSU setup.sh 不存在: {setup}")
 
-    # ---- 6) 版本号改写（行为基线 §5，--no-ver-edit 关闭）----
+    # 断言：内核树里的 kernelsu 接线
+    drv_link = os.path.join(kernel_common, "drivers", "kernelsu")
+    if not os.path.exists(drv_link):
+        fail("drivers/kernelsu 链接不存在 —— KernelSU 未接入内核树")
+    if not grep_count(os.path.join(kernel_common, "drivers/Makefile"), "kernelsu"):
+        fail("drivers/Makefile 缺少 kernelsu 条目")
+    if not grep_count(os.path.join(kernel_common, "drivers/Kconfig"), "drivers/kernelsu/Kconfig"):
+        fail("drivers/Kconfig 缺少 kernelsu 条目")
+
+    # ---- 3) SUSFS --------------------------------------------------------
+    susfs_version = None
+    if args.susfs:
+        spec = SUSFS_SPEC.get(kver)
+        if spec is None:
+            fail(f"SUSFS: 内核版本 {kver} 未配置（仅支持 {', '.join(SUSFS_SPEC)}）")
+        src = fetch_source_tree(pins["SUSFS_HOST"], pins["SUSFS_REPO"], pins["SUSFS_BRANCH"],
+                                pins["SUSFS_SHA"], os.path.join(base, "SUSFS"), "SUSFS")
+        kp_src = os.path.join(src, "kernel_patches")
+        if not os.path.isdir(kp_src):
+            fail(f"SUSFS 源缺少 kernel_patches/: {src}")
+
+        # 1) 拷贝 fs/ 与 include/
+        fs_src = os.path.join(kp_src, "fs")
+        inc_src = os.path.join(kp_src, "include")
+        if not os.path.isdir(fs_src) or not os.path.isdir(inc_src):
+            fail("SUSFS 源缺少 kernel_patches/{fs,include}")
+        for root, _d, files in os.walk(fs_src):
+            for f in files:
+                rel = os.path.relpath(os.path.join(root, f), fs_src)
+                dst = os.path.join(kernel_common, "fs", rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copyfile(os.path.join(root, f), dst)
+        for root, _d, files in os.walk(inc_src):
+            for f in files:
+                rel = os.path.relpath(os.path.join(root, f), inc_src)
+                dst = os.path.join(kernel_common, "include", rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copyfile(os.path.join(root, f), dst)
+        for need in ("fs/susfs.c", "include/linux/susfs.h", "include/linux/susfs_def.h"):
+            if not os.path.isfile(os.path.join(kernel_common, need)):
+                fail(f"SUSFS 文件拷贝缺失: {need}")
+
+        # 2) 应用 50_ 启用补丁
+        cands = sorted(f for f in os.listdir(kp_src)
+                       if f.startswith("50_") and f.endswith(".patch"))
+        if not cands:
+            fail("SUSFS 源中未找到 50_*.patch")
+        patch50 = os.path.join(kp_src, cands[0])
+        rc, rejs, fz, _o = apply_with_harvest(patch50, kernel_common, spec["fuzz"], "susfs50", audit_root)
+
+        # 3) 残留拒绝：6.6.89 需 fixup；6.6.118 必须为零
+        unexpected = [r for r in rejs if r not in spec["expected_rejects"]]
+        if unexpected:
+            fail(f"SUSFS 50_ 出现预期外的 rejects: {unexpected}")
+        if spec["fixup"]:
+            if not patches_dir:
+                fail(f"缺少 patches/ 目录（需要 {spec['fixup']}）")
+            fixup = os.path.join(patches_dir, spec["fixup"])
+            if not os.path.isfile(fixup):
+                fail(f"缺少修补补丁: {fixup}")
+            rc2, rejs2, _fz2, out2 = apply_with_harvest(fixup, kernel_common, 0, "susfs89fixup", audit_root)
+            if rc2 != 0 or rejs2:
+                fail(f"89-susfs-fixup 应用失败 (rc={rc2}, rejects={rejs2})\n{out2[-800:]}")
+            manifest(f"patch {spec['fixup']} -> OK (覆盖残留 include hunk: {sorted(set(rejs)) or 'none'})")
+        elif rejs:
+            fail(f"SUSFS 50_ 未干净应用: {rejs}")
+        manifest(f"patch {cands[0]} -> OK (fuzz_applied={fz}, expected_rejects={sorted(spec['expected_rejects'])})")
+
+        # 4) 完整性断言
+        for rel, needle, n in SUSFS_ASSERTS:
+            c = grep_count(os.path.join(kernel_common, rel), needle)
+            if c < n:
+                fail(f"SUSFS 断言失败: {rel} 缺少 {needle} (found {c})")
+        if not grep_count(os.path.join(kernel_common, "fs/Makefile"), "susfs"):
+            fail("fs/Makefile 未接线 susfs（50_ 补丁未生效）")
+
+        # 5) KernelSU 侧：ReSukiSU 系内置支持；旧世代变体尝试 10_ 补丁（best-effort）
+        ksu_kconfig = os.path.join(kernel_common, "KernelSU", "kernel", "Kconfig")
+        if vinfo["manual_susfs"]:
+            p10 = os.path.join(kp_src, "KernelSU", "10_enable_susfs_for_ksu.patch")
+            if os.path.isfile(p10) and os.path.isdir(os.path.join(kernel_common, "KernelSU")):
+                rc10, rejs10, _fz10, _o10 = apply_with_harvest(p10, os.path.join(kernel_common, "KernelSU"),
+                                                               1, "ksu10", audit_root)
+                if rc10 != 0 or rejs10:
+                    warn(f"变体 {variant} 的 KernelSU 侧 10_ 补丁未干净应用（该变体路径未验证）")
+                else:
+                    manifest("patch 10_enable_susfs_for_ksu.patch -> OK")
+        else:
+            if not grep_count(ksu_kconfig, "config KSU_SUSFS"):
+                fail(f"变体 {variant} 的 KernelSU 缺少内置 SUSFS 支持（Kconfig 无 KSU_SUSFS）")
+            log(f"variant {variant}: KernelSU 内置 SUSFS 支持，跳过 10_ 补丁（按设计）")
+            manifest("KSU-side susfs: builtin (no 10_ patch applied)")
+
+        # 6) defconfig 启用
+        append_defconfig(kernel_common, ["CONFIG_KSU_SUSFS=y"], "SUSFS")
+        m = read_text(os.path.join(kernel_common, "include/linux/susfs.h"))
+        for ln in m.splitlines():
+            if ln.startswith("#define SUSFS_VERSION"):
+                susfs_version = ln.split('"')[1] if '"' in ln else ln.split()[-1]
+        manifest(f"SUSFS version: {susfs_version}")
+        log(f"SUSFS integrated (version={susfs_version})")
+    else:
+        append_defconfig(kernel_common, ["CONFIG_KSU_SUSFS=n"], "SUSFS disabled")
+
+    # ---- 4) 版本号改写 / multi-manager ----------------------------------
     if not args.no_ver_edit:
-        append_defconfig(kernel_common, [CONFIG_KSU_FMT])
+        append_defconfig(
+            kernel_common,
+            ['CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@%REPO_NAME%"'],
+            "version format")
         log("Version edit injected into gki_defconfig")
     else:
         log("Version edit disabled (--no-ver-edit)")
 
-    # ---- 7) 其余可选功能（行为基线 §7）----
-    if args.with_bbg:
+    mm_val = "y" if args.multi_manager else "n"
+    append_defconfig(kernel_common, [f"CONFIG_KSU_MULTI_MANAGER_SUPPORT={mm_val}"], "multi-manager")
+
+    # ---- 5) ZRAM ---------------------------------------------------------
+    zram = args.zram.upper()
+    if zram == "LZ4":
+        append_defconfig(kernel_common, ["CONFIG_ZRAM=y", "CONFIG_ZRAM_WRITEBACK=y"], "zram-lz4")
+        zrepo = pins["ZRAM_PATCH_REPO"]
+        zref = pins["ZRAM_PATCH_SHA"] or "main"
         try:
-            git_clone("https://github.com/vc-teahouse/Baseband-guard.git", "main",
-                      os.path.join(base, "bbg"), cwd=base)
-            bb_setup = os.path.join(base, "bbg", "setup.sh")
-            if os.path.isfile(bb_setup):
-                sh(["bash", bb_setup], cwd=kernel_common)
-        except Exception as e:
-            log(f"warning: BBG 安装失败: {e}")
-        # bbg/setup.sh 只提示"手动设置 defconfig"；原闭源二进制会自动完成。
-        # 这里做等价自动集成：启用 CONFIG_BBG + 把 baseband_guard 追加进 CONFIG_LSM。
-        # 注意：本内核(CONFIG_LSM 来自 Kconfig default)仅写 defconfig 不生效(日志实证)，
-        #       因此按 cctv18 的做法**同时改 security/Kconfig 的 config LSM default**。
-        append_defconfig(kernel_common, ["CONFIG_BBG=y"])
-        ensure_lsm_in_defconfig(kernel_common, lsm="baseband_guard")
+            p1 = os.path.join(pd, "001-lz4.patch")
+            os_download(raw_url("github.com", zrepo, zref, "zram_patch/001-lz4.patch"), p1)
+            rc, rejs, _fz, _o = apply_with_harvest(p1, kernel_common, 3, "zram-lz4", audit_root)
+            if rc != 0 or rejs:
+                warn(f"ZRAM LZ4 补丁未干净应用 (rc={rc}, rejects={rejs}) —— 记为降级")
+            else:
+                manifest("patch 001-lz4.patch -> OK")
+            s1 = os.path.join(pd, "lz4armv8.S")
+            os_download(raw_url("github.com", zrepo, zref, "zram_patch/lz4armv8.S"), s1)
+            # 参考实现放 common/lib；同时按补丁 rename 目标预置 lib/lz4/lz4armv8/
+            os.makedirs(os.path.join(kernel_common, "lib", "lz4", "lz4armv8"), exist_ok=True)
+            shutil.copyfile(s1, os.path.join(kernel_common, "lib", "lz4armv8.S"))
+            shutil.copyfile(s1, os.path.join(kernel_common, "lib", "lz4", "lz4armv8", "lz4armv8.S"))
+            manifest("lz4armv8.S -> lib/ + lib/lz4/lz4armv8/")
+        except Exception as e:  # noqa: BLE001
+            warn(f"ZRAM LZ4 资源获取失败: {e}")
+    elif zram == "LZ4KD":
+        append_defconfig(kernel_common, ["CONFIG_ZRAM=y", "CONFIG_ZRAM_LZ4KD=y"], "zram-lz4kd")
+        try:
+            p1 = os.path.join(pd, "lz4kd.patch")
+            os_download(kp_raw("other/lz4kd.patch"), p1)
+            rc, rejs, _fz, _o = apply_with_harvest(p1, kernel_common, 3, "lz4kd", audit_root)
+            if rc != 0 or rejs:
+                warn(f"LZ4KD 补丁未干净应用 (rc={rc}, rejects={rejs})")
+            else:
+                manifest("patch lz4kd.patch -> OK")
+        except Exception as e:  # noqa: BLE001
+            warn(f"LZ4KD 补丁获取失败: {e}")
+    if zram in ("LZ4", "LZ4KD") and kver == "6.6.118":
+        try:
+            p2 = os.path.join(pd, "lib-update-zram-118.patch")
+            os_download(kp_raw("other/lib-Update-zram-to-1.10.0-6.6.118.patch"), p2)
+            rc, rejs, _fz, _o = apply_with_harvest(p2, kernel_common, 3, "zram-lib118", audit_root)
+            if rc != 0 or rejs:
+                warn("zram 库升级补丁未干净应用")
+            else:
+                manifest("patch lib-Update-zram-to-1.10.0-6.6.118.patch -> OK")
+        except Exception as e:  # noqa: BLE001
+            warn(f"zram 库升级补丁失败: {e}")
+
+    # ---- 6) BBG（关键，启用时严格）-------------------------------------
+    if args.with_bbg:
+        bbg_dir = os.path.join(kernel_common, "Baseband-guard")
+        bbg_ref = pins["BBG_REF"]
+        clone_kernelsu(pins["BBG_REPO"], "main", bbg_ref, bbg_dir)  # 复用同一克隆逻辑
+        setup = os.path.join(bbg_dir, "setup.sh")
+        if not os.path.isfile(setup):
+            fail("Baseband-guard setup.sh 缺失")
+        rc, out = run(["bash", "Baseband-guard/setup.sh", bbg_ref] if bbg_ref
+                      else ["bash", "Baseband-guard/setup.sh"], cwd=kernel_common, check=False, capture=True)
+        if rc != 0:
+            fail(f"Baseband-guard setup.sh 失败 (rc={rc})\n{out[-800:]}")
+        append_defconfig(kernel_common, ["CONFIG_BBG=y"], "BBG")
+        ensure_lsm_in_defconfig(kernel_common)
         kcfg = os.path.join(kernel_common, "security", "Kconfig")
         if os.path.isfile(kcfg):
             sed_expr = ("/^config LSM$/,/^help$/{ "
                         "/^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }")
-            sh(["sed", "-i", sed_expr, kcfg], cwd=kernel_common)
+            run(["sed", "-i", sed_expr, kcfg], cwd=kernel_common)
             log("security/Kconfig: CONFIG_LSM default 注入 baseband_guard")
-    if args.mountify:
-        # mountify = backslashxx/mountify（KSU metamodule，OverlayFS 运行时挂载隐藏，非内核补丁）。
-        # 其 README 要求 CONFIG_OVERLAY_FS=y（必需）+ CONFIG_TMPFS_XATTR=y（强烈建议），
-        # 安装时 customize.sh 会据此校验；不需要也不存在 CONFIG_KSU_MOUNTIFY。
-        append_defconfig(kernel_common, ["CONFIG_OVERLAY_FS=y", "CONFIG_TMPFS_XATTR=y"])
-        log("Mountify enabled")
-    if args.fengchi:
-        src = PATCH_FENGCHI_118 if kver == "6.6.118" else PATCH_FENGCHI_89
-        try:
-            d = os.path.join(patches_dir, "fengchi.patch")
-            download(src, d)
-            apply_patch(d, cwd=kernel_common)
-            log("fengchi patch applied")
-        except Exception as e:
-            log(f"warning: fengchi 补丁失败: {e}")
-    if args.droidspace:
-        # droidspace.patch 不定义任何 CONFIG 符号（纯 overlayfs/vfs/tcp 修复），仅应用补丁
-        try:
-            d = os.path.join(patches_dir, "droidspace.patch")
-            download(PATCH_DROIDSPACE, d)
-            apply_patch(d, cwd=kernel_common)
-        except Exception as e:
-            log(f"warning: droidspace 补丁失败: {e}")
-    if args.ntsync:
-        # 真实符号：CONFIG_NTSYNC（由 ntsync_compat 补丁在 drivers/misc/Kconfig 定义 config NTSYNC）
-        append_defconfig(kernel_common, ["CONFIG_NTSYNC=y"])
-        try:
-            b = os.path.join(patches_dir, "ntsync_base.patch")
-            c = os.path.join(patches_dir, "ntsync_compat.patch")
-            download(PATCH_NTSYNC_BASE, b)
-            download(PATCH_NTSYNC_COMPAT, c)
-            apply_patch(b, cwd=kernel_common)
-            apply_patch(c, cwd=kernel_common)
-        except Exception as e:
-            log(f"warning: ntsync 补丁失败: {e}")
-    if args.hookless:
-        # 基线 §7：hookless/manual hook 来自三条补丁，逐条应用（失败各自降级）
-        try:
-            d = os.path.join(patches_dir, "hookless.patch")
-            download(PATCH_MANUAL_HOOK, d)
-            apply_patch(d, cwd=kernel_common)
-        except Exception as e:
-            log(f"warning: hookless/manual_hook 补丁失败: {e}")
-        try:
-            d = os.path.join(patches_dir, "scope-hooks.patch")
-            download(PATCH_SCOPE_HOOKS, d)
-            apply_patch(d, cwd=kernel_common)
-        except Exception as e:
-            log(f"warning: hookless/scope-hooks 补丁失败: {e}")
-        try:
-            d = os.path.join(patches_dir, "suki-syscall-hooks.patch")
-            download(PATCH_SUKISU_HOOKS, d)
-            apply_patch(d, cwd=kernel_common)
-        except Exception as e:
-            log(f"warning: hookless/suki-syscall-hooks 补丁失败: {e}")
-    # --multi-manager（store_false：默认开即多管理器启用，显式传参即关；ReSukiSU only）
-    # 真实符号：KSU_MULTI_MANAGER_SUPPORT（ReSukiSU Kconfig）
-    mm_val = "y" if args.multi_manager else "n"
-    append_defconfig(kernel_common, [f"CONFIG_KSU_MULTI_MANAGER_SUPPORT={mm_val}"])
+        # BBG 构建期 $(error) 防线断言
+        if not os.path.exists(os.path.join(kernel_common, "security", "baseband-guard")):
+            fail("security/baseband-guard 链接/目录不存在（BBG 未接入）")
+        if "baseband_guard" not in read_text(kcfg):
+            fail("security/Kconfig 未包含 baseband_guard")
+        if "CONFIG_BBG=y" not in read_text(os.path.join(kernel_common, "arch/arm64/configs/gki_defconfig")):
+            fail("defconfig 未写入 CONFIG_BBG=y")
+        manifest("BBG: setup OK + defconfig LSM + security/Kconfig default OK")
 
-    # ---- 8) 统一 defconfig sed 处理（行为基线 §5）----
-    df = os.path.join(kernel_common, "arch", "arm64", "configs", "gki_defconfig")
+    # ---- 7) 可选功能（降级记录，不阻断）--------------------------------
+    if args.mountify:
+        append_defconfig(kernel_common, ["CONFIG_OVERLAY_FS=y", "CONFIG_TMPFS_XATTR=y"], "mountify")
+        manifest("mountify: CONFIG_OVERLAY_FS=y + CONFIG_TMPFS_XATTR=y")
+    if args.fengchi:
+        p = kp_raw("other/fengchi_oneplus_ace_6_118.patch" if kver == "6.6.118"
+                   else "other/fengchi_oneplus_ace_6_89.patch")
+        try:
+            d = os.path.join(pd, "fengchi.patch")
+            os_download(p, d)
+            rc, rejs, _fz, _o = apply_with_harvest(d, kernel_common, 3, "fengchi", audit_root)
+            if rc != 0 or rejs:
+                warn(f"fengchi 补丁未干净应用 (rejects={rejs})")
+            else:
+                manifest("patch fengchi -> OK")
+        except Exception as e:  # noqa: BLE001
+            warn(f"fengchi 失败: {e}")
+    if args.droidspace:
+        try:
+            d = os.path.join(pd, "droidspace.patch")
+            os_download(kp_raw("other/droidspace.patch"), d)
+            rc, rejs, _fz, _o = apply_with_harvest(d, kernel_common, 3, "droidspace", audit_root)
+            if rc != 0 or rejs:
+                warn(f"droidspace 补丁未干净应用 (rejects={rejs})")
+            else:
+                manifest("patch droidspace -> OK")
+        except Exception as e:  # noqa: BLE001
+            warn(f"droidspace 失败: {e}")
+    if args.ntsync:
+        append_defconfig(kernel_common, ["CONFIG_NTSYNC=y"], "ntsync")
+        try:
+            nref = pins["NTSC_SHA"] or "main"
+            b = os.path.join(pd, "ntsync_base.patch")
+            c = os.path.join(pd, "ntsync_compat.patch")
+            os_download(raw_url("github.com", pins["NTSC_REPO"], nref, "NTsync/ntsync_base.patch"), b)
+            os_download(raw_url("github.com", pins["NTSC_REPO"], nref, "NTsync/ntsync_compat_android15-6.6.patch"), c)
+            for tag, f in (("ntsync-base", b), ("ntsync-compat", c)):
+                rc, rejs, _fz, _o = apply_with_harvest(f, kernel_common, 3, tag, audit_root)
+                if rc != 0 or rejs:
+                    warn(f"{tag} 补丁未干净应用 (rejects={rejs})")
+                else:
+                    manifest(f"patch {os.path.basename(f)} -> OK")
+        except Exception as e:  # noqa: BLE001
+            warn(f"ntsync 失败: {e}")
+    if args.hookless:
+        # URL 修复：两个补丁在仓库根目录（旧版误加 other/ 前缀，404）
+        for tag, path in (
+            ("hookless-manual", "manual_hook/kernel-gki.patch"),
+            ("hookless-scope", "scope-miniminzed/scope-minnimized-hooks-v1.9.patch"),
+        ):
+            try:
+                d = os.path.join(pd, os.path.basename(path))
+                os_download(kp_raw(path), d)
+                rc, rejs, _fz, _o = apply_with_harvest(d, kernel_common, 3, tag, audit_root)
+                if rc != 0 or rejs:
+                    warn(f"{tag} 未干净应用 (rejects={rejs})")
+                else:
+                    manifest(f"patch {path} -> OK")
+            except Exception as e:  # noqa: BLE001
+                warn(f"{tag} 失败: {e}")
+        try:
+            d = os.path.join(pd, "syscall_hooks.patch")
+            os_download(raw_url("github.com", pins["SUKI_HOOKS_REPO"], "main", "hooks/syscall_hooks.patch"), d)
+            rc, rejs, _fz, _o = apply_with_harvest(d, kernel_common, 3, "suki-hooks", audit_root)
+            if rc != 0 or rejs:
+                warn("suki syscall hooks 未干净应用")
+            else:
+                manifest("patch syscall_hooks.patch -> OK")
+        except Exception as e:  # noqa: BLE001
+            warn(f"suki hooks 失败: {e}")
+    if args.kpm:
+        kptools = os.path.join(base, "kptools-linux")
+        kpimg = os.path.join(base, "kpimg-linux")
+        try:
+            os_download("https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kptools-linux", kptools)
+            os_download("https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kpimg-linux", kpimg)
+            os.chmod(kptools, 0o755)
+            manifest("KPM: kptools/kpimg downloaded")
+        except Exception as e:  # noqa: BLE001
+            warn(f"KPM 工具下载失败: {e}")
+        if args.kpm_patch:
+            img = os.path.abspath(args.kpm_patch)
+            if not os.path.isfile(img):
+                fail(f"Image not found: {img}")
+            if os.path.basename(img) != "Image":
+                fail(f"Image file name must be 'Image', got '{os.path.basename(img)}'")
+            out_img = img + ".kpm"
+            rc, out = run([kptools, "-p", "-i", img, "-k", kpimg, "-o", out_img], cwd=base, check=False, capture=True)
+            if rc != 0:
+                fail(f"KPM Image 补丁失败\n{out[-500:]}")
+            os.replace(out_img, img)
+            manifest("KPM(Image) patched (KPatch-Next)")
+
+    # ---- 8) defconfig 统一 sed ------------------------------------------
+    df = os.path.join(kernel_common, "arch/arm64/configs/gki_defconfig")
     if os.path.isfile(df):
         sed_file("-4k", "", df)
-        # 基线 §5：无条件把 CONFIG_ZRAM=m 改为 y（对 LZ4/LZ4KD 追加的 =y 无副作用）
         sed_file("CONFIG_ZRAM=m", "CONFIG_ZRAM=y", df)
 
-    # ---- 9) config_summary.txt（行为基线 §1 / buildbot.py 读取）----
-    summary = (
-        f"Kernel Version: {kver}\n"
-        f"KernelSU Variant: {variant}\n"
-        f"KSU Branch: {args.ksu_branch}\n"
-        f"Hookless Support: {'Enabled' if args.hookless else 'Disabled'}\n"
-        f"SUSFS Support: {'Enabled' if args.susfs else 'Disabled'}\n"
-        f"Baseband_guard Support: {'Enabled' if args.with_bbg else 'Disabled'}\n"
-        f"Mountify Support: {'Enabled' if args.mountify else 'Disabled'}\n"
-        f"Fengchi: {'Enabled' if args.fengchi else 'Disabled'}\n"
-        f"KPM Support: {'Enabled' if args.kpm else 'Disabled'}\n"
-        f"Multi Manager Support: {'Disabled' if not args.multi_manager else 'Enabled'}\n"
-        f"Droidspace-OSS: {'Enabled' if args.droidspace else 'Disabled'}\n"
-        f"NTSync: {'Enabled' if args.ntsync else 'Disabled'}\n"
-        f"ZRAM Option: {zram}\n"
-        f"Version Edit in gki_defconfig: {'Disabled' if args.no_ver_edit else 'Enabled'}\n"
-    )
-    with open(os.path.join(base, "config_summary.txt"), "w") as f:
-        f.write(summary)
+    # ---- 9) 摘要与清单 ---------------------------------------------------
+    summary_lines = [
+        f"Kernel Version: {kver}",
+        f"KernelSU Variant: {variant}",
+        f"KSU Branch: {args.ksu_branch}",
+        f"Hookless Support: {'Enabled' if args.hookless else 'Disabled'}",
+        f"SUSFS Support: {'Enabled (' + str(susfs_version) + ')' if args.susfs else 'Disabled'}",
+        f"Baseband_guard Support: {'Enabled' if args.with_bbg else 'Disabled'}",
+        f"Mountify Support: {'Enabled' if args.mountify else 'Disabled'}",
+        f"Fengchi: {'Enabled' if args.fengchi else 'Disabled'}",
+        f"KPM Support: {'Enabled' if args.kpm else 'Disabled'}",
+        f"Multi Manager Support: {'Disabled' if not args.multi_manager else 'Enabled'}",
+        f"Droidspace-OSS: {'Enabled' if args.droidspace else 'Disabled'}",
+        f"NTSync: {'Enabled' if args.ntsync else 'Disabled'}",
+        f"ZRAM Option: {zram}",
+        f"Version Edit in gki_defconfig: {'Disabled' if args.no_ver_edit else 'Enabled'}",
+        f"Degraded Items: {len(STATE['degraded'])}",
+    ]
+    with open(os.path.join(base, "config_summary.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(summary_lines) + "\n")
 
+    with open(os.path.join(base, "build_manifest.txt"), "w", encoding="utf-8") as f:
+        f.write(f"Build Manifest (configure v{CONFIGURE_VERSION})\n")
+        f.write("=" * 60 + "\n")
+        for line in STATE["manifest"]:
+            f.write(line + "\n")
+        if STATE["degraded"]:
+            f.write("\n[degraded]\n")
+            for d in STATE["degraded"]:
+                f.write(f"- {d}\n")
+
+    if STATE["degraded"]:
+        log("以下是已记录的降级项（构建可继续，但请知悉）：")
+        for d in STATE["degraded"]:
+            log(f"  - {d}")
     log("Configuration completed.")
     return 0
 
