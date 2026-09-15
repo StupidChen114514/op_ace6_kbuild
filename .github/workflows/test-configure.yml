@@ -33,9 +33,9 @@ jobs:
             > /tmp/mock/kernel_platform/common/Makefile
           printf 'CONFIG_ZRAM=m\nCONFIG_FOO=y\n' \
             > /tmp/mock/kernel_platform/common/arch/arm64/configs/gki_defconfig
-          cp repo/scripts/configure /tmp/mock/configure
+          cp "$GITHUB_WORKSPACE/repo/scripts/configure" /tmp/mock/configure
           mkdir -p /tmp/mock/patches
-          cp repo/scripts/patches/*.patch /tmp/mock/patches/ 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE"/repo/scripts/patches/*.patch /tmp/mock/patches/ 2>/dev/null || true
 
       - name: --help works
         run: python3 /tmp/mock/configure --help > /dev/null
@@ -62,8 +62,8 @@ jobs:
 
       - name: pins.env is parsed
         run: |
+          cp "$GITHUB_WORKSPACE/repo/scripts/pins.env" /tmp/mock/pins.env
           cd /tmp/mock
-          cp repo/scripts/pins.env pins.env
           python3 configure --ksu-variant RESUKISU --susfs --dry-run | tee /tmp/dry2.log
           grep -q "pins loaded" /tmp/dry2.log
           echo "PINS ASSERTIONS PASSED"
