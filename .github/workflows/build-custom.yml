@@ -144,10 +144,21 @@ jobs:
         with: 
           path: scripts
 
+      - name: Record revisions
+        run: |
+          cd kernel_workspace
+          {
+            echo "kernel_platform/common    $(git -C kernel_platform/common rev-parse HEAD 2>/dev/null || echo n/a)"
+            echo "kernel_platform/msm-kernel $(git -C kernel_platform/msm-kernel rev-parse HEAD 2>/dev/null || echo n/a)"
+            echo "builder scripts           $(git -C ../scripts rev-parse HEAD 2>/dev/null || echo n/a)"
+          } | tee build_revisions.txt
+
       - name: Run configure
         run: |
           cp ./scripts/scripts/configure ./kernel_workspace/
           chmod +x ./kernel_workspace/configure
+          if [ -d ./scripts/scripts/patches ]; then cp -r ./scripts/scripts/patches ./kernel_workspace/patches; fi
+          if [ -f ./scripts/scripts/pins.env ]; then cp ./scripts/scripts/pins.env ./kernel_workspace/pins.env; fi
           
           ARGS="--ksu-variant ${{ github.event.inputs.KSU }} --ksu-branch ${{ github.event.inputs.KSU_BRANCH }}"
           if [ "${{ github.event.inputs.SUSFS }}" == "true" ]; then

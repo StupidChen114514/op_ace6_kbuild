@@ -12,7 +12,10 @@ Oneplus ACE6 内核构建脚本，可以集成KernelSU及其变体 也包括SUSF
 
 - 解析工作流传入的同一套命令行参数（`--ksu-variant`、`--ksu-branch`、`--susfs`、`--zram LZ4|LZ4KD`、`--kpm`、`--mountify`、`--ntsync`、`--fengchi`、`--droidspace`、`--with-bbg`、`--hookless`、`--multi-manager`、`--no-ver-edit`），安装所选 KernelSU 变体、按需集成 SUSFS（含 ReSukiSU/NEXT 的"集成分支"路径）、应用可选功能补丁，并向 `gki_defconfig` 追加 CONFIG。
 - 脚本**不含任何白名单/黑名单远程控制逻辑**，所有功能均由本地开关驱动，完全可审计。
-- 仅在开启特定功能（KPM）时，自动修改 `arch/arm64/Makefile` 并打补丁，确保最终生成的内核镜像按需集成目标功能。
+- 开启 KPM 时下载 KPatch-Next 工具，并在给定 `--kpm-patch` 时对已编译 Image 打补丁（不在编译期改写 Makefile）。
+- 通过 `scripts/pins.env` 固定上游版本（SHA，可用环境变量覆盖），每次构建输出 `build_manifest.txt`（记录实际解析到的来源与每个补丁的应用结果）。
+- **关键步骤硬失败**：SUSFS / KernelSU / BBG 集成任一步失败时 configure 立即以非零退出——不再出现"构建绿了但功能静默缺失"。
+- 两个内核世代（6.6.89 / 6.6.118）的补丁可应用性由 `verify patches` CI 工作流持续校验。
 
 ## 使用方法 
 

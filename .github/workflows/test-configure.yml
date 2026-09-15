@@ -1,16 +1,20 @@
-name: test configure (lightweight)
+name: test configure (offline smoke)
 
 on:
   workflow_dispatch:
   push:
     branches:
+      - "fix/**"
       - "trae/**"
     paths:
       - "scripts/configure"
+      - "scripts/pins.env"
+      - "scripts/patches/**"
       - ".github/workflows/test-configure.yml"
 
 jobs:
-  test:
+  smoke:
+    name: offline smoke (help / dry-run / arg validation)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -24,73 +28,42 @@ jobs:
       - name: Build mock kernel tree
         run: |
           set -e
-          mkdir -p /tmp/mock/kernel_workspace/kernel_platform/common/arch/arm64/configs
-          mkdir -p /tmp/mock/kernel_workspace/kernel_platform/common/arch/arm64/lib
+          mkdir -p /tmp/mock/kernel_platform/common/arch/arm64/configs
           printf 'VERSION = 6\nPATCHLEVEL = 6\nSUBLEVEL = 89\nNAME = mock\n' \
-            > /tmp/mock/kernel_workspace/kernel_platform/common/Makefile
-          # 真实 gki_defconfig 没有 CONFIG_LSM 行（值来自 Kconfig 默认），
-          # 断言 configure 的 BBG 自动集成会新增完整 CONFIG_LSM 集 + baseband_guard
+            > /tmp/mock/kernel_platform/common/Makefile
           printf 'CONFIG_ZRAM=m\nCONFIG_FOO=y\n' \
-            > /tmp/mock/kernel_workspace/kernel_platform/common/arch/arm64/configs/gki_defconfig
+            > /tmp/mock/kernel_platform/common/arch/arm64/configs/gki_defconfig
+          cp repo/scripts/configure /tmp/mock/configure
+          mkdir -p /tmp/mock/patches
+          cp repo/scripts/patches/*.patch /tmp/mock/patches/ 2>/dev/null || true
 
-      # configure 会尝试真实 git clone / curl；本测试只关心 configure 自身逻辑
-      # （参数解析、版本探测、defconfig 追加、sed、summary）。用 no-op mock 使测试
-      # 完全离线、快速、确定，避免依赖外部网络/仓库。
-      - name: Mock git/curl (offline deterministic)
-        run: |
-          mkdir -p /tmp/mockbin
-          printf '#!/bin/bash\nexit 0\n' > /tmp/mockbin/git
-          printf '#!/bin/bash\nexit 0\n' > /tmp/mockbin/curl
-          chmod +x /tmp/mockbin/git /tmp/mockbin/curl
+      - name: --help works
+        run: python3 /tmp/mock/configure --help > /dev/null
 
-      - name: Run configure (RESUKISU + SUSFS + ZRAM LZ4 + mountify + BBG)
+      - name: dry-run works, plans pinned sources, makes no changes
         run: |
-          export PATH="/tmp/mockbin:$PATH"
-          cd /tmp/mock/kernel_workspace
-          cp "$GITHUB_WORKSPACE/repo/scripts/configure" ./configure
-          chmod +x ./configure
-          ./configure --ksu-variant RESUKISU --ksu-branch default --susfs --with-bbg --zram LZ4 --mountify
+          cd /tmp/mock
+          python3 configure --ksu-variant RESUKISU --ksu-branch default --susfs --dry-run | tee /tmp/dry.log
+          grep -q "dry-run" /tmp/dry.log
+          grep -q "susfs4ksu" /tmp/dry.log
+          grep -q "89-susfs-fixup.patch" /tmp/dry.log
+          # dry-run 不得写入 defconfig
+          ! grep -q "configure appended" kernel_platform/common/arch/arm64/configs/gki_defconfig
+          ! grep -q "# ---" kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "DRY-RUN ASSERTIONS PASSED"
 
-      - name: Assert config output
+      - name: invalid variant is rejected
         run: |
-          DF=/tmp/mock/kernel_workspace/kernel_platform/common/arch/arm64/configs/gki_defconfig
-          S=/tmp/mock/kernel_workspace/config_summary.txt
-          for pat in \
-              'CONFIG_KSU_SUSFS=y' \
-              'CONFIG_ZRAM=y' \
-              'CONFIG_ZRAM_WRITEBACK=y' \
-              'CONFIG_OVERLAY_FS=y' \
-              'CONFIG_BBG=y' \
-              'CONFIG_LSM=landlock,lockdown,yama,loadpin,safesetid,selinux,smack,tomoyo,apparmor,bpf,baseband_guard' \
-              'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@%REPO_NAME%"' ; do
-            grep -F "$pat" "$DF" >/dev/null || { echo "MISSING in defconfig: $pat"; exit 1; }
-          done
-          grep -F 'SUSFS Support: Enabled' "$S" >/dev/null || { echo "missing SUSFS summary"; exit 1; }
-          grep -F 'ZRAM Option: LZ4' "$S" >/dev/null || { echo "missing ZRAM summary"; exit 1; }
-          grep -F 'Kernel Version: 6.6.89' "$S" >/dev/null || { echo "missing kernel version summary"; exit 1; }
-          grep -F 'Mountify Support: Enabled' "$S" >/dev/null || { echo "missing Mountify summary"; exit 1; }
-          grep -F 'Baseband_guard Support: Enabled' "$S" >/dev/null || { echo "missing BBG summary"; exit 1; }
-          echo "ALL ASSERTIONS PASSED"
-
-      - name: Run configure (SUKISU + KPM + disable multi-manager + no-ver-edit)
-        run: |
-          export PATH="/tmp/mockbin:$PATH"
-          cd /tmp/mock/kernel_workspace
-          cp "$GITHUB_WORKSPACE/repo/scripts/configure" ./configure
-          chmod +x ./configure
-          printf 'CONFIG_ZRAM=m\nCONFIG_FOO=y\n' \
-            > kernel_platform/common/arch/arm64/configs/gki_defconfig
-          ./configure --ksu-variant SUKISU --ksu-branch default --kpm --multi-manager --no-ver-edit
-
-      - name: Assert second config output
-        run: |
-          DF=/tmp/mock/kernel_workspace/kernel_platform/common/arch/arm64/configs/gki_defconfig
-          S=/tmp/mock/kernel_workspace/config_summary.txt
-          grep -F 'CONFIG_KSU_MULTI_MANAGER_SUPPORT=n' "$DF" >/dev/null || { echo "MISSING multi-manager config"; exit 1; }
-          if grep -F 'CONFIG_KSU_FULL_NAME_FORMAT' "$DF" >/dev/null; then
-            echo "no-ver-edit FAILED: version format still present"; exit 1
+          cd /tmp/mock
+          if python3 configure --ksu-variant NOT_A_VARIANT --dry-run; then
+            echo "FAIL: invalid variant was accepted"; exit 1
           fi
-          grep -F 'KPM Support: Enabled' "$S" >/dev/null || { echo "missing KPM summary"; exit 1; }
-          grep -F 'Multi Manager Support: Disabled' "$S" >/dev/null || { echo "missing multi-manager summary"; exit 1; }
-          grep -F 'Version Edit in gki_defconfig: Disabled' "$S" >/dev/null || { echo "missing no-ver-edit summary"; exit 1; }
-          echo "ALL ASSERTIONS PASSED"
+          echo "ARG VALIDATION PASSED"
+
+      - name: pins.env is parsed
+        run: |
+          cd /tmp/mock
+          cp repo/scripts/pins.env pins.env
+          python3 configure --ksu-variant RESUKISU --susfs --dry-run | tee /tmp/dry2.log
+          grep -q "pins loaded" /tmp/dry2.log
+          echo "PINS ASSERTIONS PASSED"

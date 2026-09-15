@@ -18,6 +18,9 @@ The open-source tool `scripts/configure` (Python) acts as a build-time helper:
 
 - It parses the same CLI arguments the workflow passes (`--ksu-variant`, `--ksu-branch`, `--susfs`, `--zram LZ4|LZ4KD`, `--kpm`, `--mountify`, `--ntsync`, `--fengchi`, `--droidspace`, `--with-bbg`, `--hookless`, `--multi-manager`, `--no-ver-edit`), installing the selected KernelSU variant, integrating SUSFS when enabled (including the ReSukiSU/NEXT "integrated branch" path), applying optional feature patches, and appending CONFIG lines to `gki_defconfig`.
 - It contains **no whitelist/blacklist remote-control logic**. All features are driven purely by local CLI switches, and the script is fully auditable.
+- Version pinning via `scripts/pins.env` (upstream SHAs, env-overridable) and a per-build `build_manifest.txt` recording every resolved source and patch result.
+- **Strict failure semantics**: if a critical integration step (SUSFS / KernelSU / BBG) fails, the configure step exits non-zero immediately instead of failing minutes later inside the kernel build.
+- Patch applicability for both kernel generations (6.6.89 / 6.6.118) is continuously checked by the `verify patches` CI workflow.
 
 ## Usage
 

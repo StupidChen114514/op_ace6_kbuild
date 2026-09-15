@@ -1,0 +1,28 @@
+name: verify patches
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "为什么手动触发（记录用）"
+        required: false
+        type: string
+  push:
+    branches:
+      - "fix/**"
+      - "trae/**"
+      - "main"
+    paths:
+      - "scripts/**"
+      - ".github/workflows/verify-patches.yml"
+
+jobs:
+  verify:
+    name: SUSFS patch matrix + pinned URLs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Verify SUSFS patch applicability matrix
+        run: python3 scripts/tools/verify_susfs_patches.py
