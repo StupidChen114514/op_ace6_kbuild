@@ -5,14 +5,23 @@ configure v2 — OnePlus Ace6 内核构建配置器（开源）
 
 替代原闭源 `scripts/configure`（UPX/Nuitka 黑盒）。本版基于 2026-09-15 的实测结论重写：
 
-行为与来源（均已实测验证）：
+行为与来源（均已实测验证，对照上游闭源行为逐项核对）：
   - KSU 变体：clone 对应仓库并执行其 kernel/setup.sh；ReSukiSU 系列的 SUSFS 支持内置，
-    不需要（且当前版本也打不上）KernelSU 侧 10_ 补丁。
+    不需要（且当前版本也打不上）KernelSU 侧 10_ 补丁。MAMBOSU / NEXT 在启用 SUSFS 时
+    使用其集成分支（susfs-mambo-master / dev-susfs，依据闭源行为基线 §2）。
   - SUSFS 内核侧补丁：统一用 simonpunk/susfs4ksu（gitlab, 分支 gki-android15-6.6）：
       * 6.6.118 : 补丁可 100% 干净应用；
       * 6.6.89  : -F2 应用（1 处 include hunk 带模糊）+ `patches/89-susfs-fixup.patch`
                   修补唯一残留的 fs/proc/base.c include hunk —— 已端到端验证 0 残留。
-  - 关键步骤硬失败：SUSFS / KSU / BBG / defconfig 写入任一失败 → 退出码非 0
+  - ZRAM LZ4：统一用 luyancib-org/kernel_patches 的
+    lib-Update-zram-to-1.10.0-6.6.118.patch（与闭源 118 行为一致；raw 字节 + fuzz=0）：
+      * 6.6.118 : 零拒绝干净应用；
+      * 6.6.89  : 2 个预期拒绝（fs/f2fs/compress.c、lib/lz4/lz4hc_compress.c）→
+                  `patches/89-zram-lz4-fixup.patch` 覆盖前者 + 显式移除后者
+                  （旧文件内容与补丁删除块不符，属 89 树差异）—— clean-room 双引擎验证 0 残留。
+  - KPM：KPatch-Next 后置注入（pins 钉死 release tag），放开到全部 KSU 变体；
+    要求内核 gki_defconfig 含 CONFIG_KALLSYMS_ALL=y（两代均已自带，断言兜底）。
+  - 关键步骤硬失败：SUSFS / KSU / BBG / defconfig 写入 / ZRAM LZ4 任一失败 → 退出码非 0
     （可选 --allow-degraded 降级为警告，仅用于排障）。
   - 版本钉死：读取 pins.env（含上游 commit SHA，置空=跟踪上游最新），并在构建产物里
     生成 build_manifest.txt（记录实际解析到的 SHA 与每个补丁的应用结果）。
@@ -33,7 +42,7 @@ import sys
 import tarfile
 import urllib.request
 
-CONFIGURE_VERSION = "2.0.0"
+CONFIGURE_VERSION = "2.1.0"
 
 DESCRIPTION = "The configure of Kernel for Oneplus Ace 6 (open-source)."
 
@@ -52,9 +61,9 @@ DEFAULT_PINS = {
     # 通用补丁仓库 luyancib-org/kernel_patches
     "KERNEL_PATCHES_REPO": "luyancib-org/kernel_patches",
     "KERNEL_PATCHES_SHA": "3e36443e8b31b90c5aa8b1aa0d0250ad259bfd97",
-    # ZRAM LZ4 补丁（cctv18/oppo_oplus_realme_sm8750）
-    "ZRAM_PATCH_REPO": "cctv18/oppo_oplus_realme_sm8750",
-    "ZRAM_PATCH_SHA": "21db9e7d547ca625bd5aa734fb5dfc8b94ea48ef",
+    # KPM（KPatch-Next 后置注入；ZRAM LZ4 补丁经 KERNEL_PATCHES_* 取用）
+    "KPATCH_REPO": "KernelSU-Next/KPatch-Next",
+    "KPATCH_TAG": "0.13.5-2",
     # Baseband-guard
     "BBG_REPO": "vc-teahouse/Baseband-guard",
     "BBG_REF": "",                     # 空 = main
@@ -67,21 +76,29 @@ DEFAULT_PINS = {
 
 # KSU 变体表：repo=KernelSU 仓库；branch=默认分支；
 # manual_susfs=True 表示该变体需要手动应用 10_enable_susfs_for_ksu.patch（旧世代路径，未验证）。
+# susfs_branch=SUSFS 模式下的集成分支（依据闭源行为基线 §2 [实测字符串表]；未做真机验证）。
 KSU_VARIANTS = {
-    "default":  {"repo": "backslashxx/KernelSU",        "branch": "master", "manual_susfs": True},
-    "KSU":      {"repo": "backslashxx/KernelSU",        "branch": "master", "manual_susfs": True},
-    "XXKSU":    {"repo": "backslashxx/KernelSU",        "branch": "master", "manual_susfs": True},
-    "MAMBOSU":  {"repo": "RapliVx/KernelSU",            "branch": "master", "manual_susfs": True},
-    "SUKISU":   {"repo": "SukiSU-Ultra/SukiSU-Ultra",   "branch": "main",   "manual_susfs": False},
-    "RESUKISU": {"repo": "ReSukiSU/ReSukiSU",           "branch": "main",   "manual_susfs": False},
-    "RKSU":     {"repo": "ReSukiSU/ReSukiSU",           "branch": "main",   "manual_susfs": False},
-    "NEXT":     {"repo": "KernelSU-Next/KernelSU-Next", "branch": "dev",    "manual_susfs": False},
+    "default":  {"repo": "backslashxx/KernelSU",        "branch": "master", "manual_susfs": True,  "susfs_branch": None},
+    "KSU":      {"repo": "backslashxx/KernelSU",        "branch": "master", "manual_susfs": True,  "susfs_branch": None},
+    "XXKSU":    {"repo": "backslashxx/KernelSU",        "branch": "master", "manual_susfs": True,  "susfs_branch": None},
+    "MAMBOSU":  {"repo": "RapliVx/KernelSU",            "branch": "master", "manual_susfs": True,  "susfs_branch": "susfs-mambo-master"},
+    "SUKISU":   {"repo": "SukiSU-Ultra/SukiSU-Ultra",   "branch": "main",   "manual_susfs": False, "susfs_branch": None},
+    "RESUKISU": {"repo": "ReSukiSU/ReSukiSU",           "branch": "main",   "manual_susfs": False, "susfs_branch": None},
+    "RKSU":     {"repo": "ReSukiSU/ReSukiSU",           "branch": "main",   "manual_susfs": False, "susfs_branch": None},
+    "NEXT":     {"repo": "KernelSU-Next/KernelSU-Next", "branch": "dev",    "manual_susfs": False, "susfs_branch": "dev-susfs"},
 }
 
 # SUSFS 应用规格（按内核版本）：fuzz=应用模糊度；fixup=需要追加的修补补丁文件名
 SUSFS_SPEC = {
     "6.6.118": {"fuzz": 0, "fixup": None,                    "expected_rejects": set()},
     "6.6.89":  {"fuzz": 2, "fixup": "89-susfs-fixup.patch",  "expected_rejects": {"fs/proc/base.c"}},
+}
+
+# ZRAM LZ4 应用规格（按内核版本）：与 SUSFS_SPEC 同构；fixup 见 patches/89-zram-lz4-fixup.patch
+ZRAM_LZ4_SPEC = {
+    "6.6.118": {"expected_rejects": set(), "fixup": None},
+    "6.6.89":  {"expected_rejects": {"fs/f2fs/compress.c", "lib/lz4/lz4hc_compress.c"},
+                "fixup": "89-zram-lz4-fixup.patch"},
 }
 
 # SUSFS 完整性断言（镜像 ReSukiSU 的编译期 hook 检查，问题提前到 configure 阶段暴露）
@@ -390,7 +407,7 @@ def build_parser():
     p.add_argument("--mountify", action="store_true", help="Enable Mountify module support")
     p.add_argument("--fengchi", action="store_true", help="Setup fengchi patch")
     p.add_argument("--no-ver-edit", action="store_true", help="Disable version edit in gki_defconfig")
-    p.add_argument("--kpm", action="store_true", help="Enable KPM module support (SukiSU only)")
+    p.add_argument("--kpm", action="store_true", help="Enable KPM module support (KPatch-Next post-build; all KSU variants)")
     p.add_argument("--kpm-patch", default=None, help="Path to Image that needs to be patched with KPM")
     p.add_argument("--multi-manager", action="store_false", default=True,
                    help="Disable Multi manager Support (ReSukiSU only)")
@@ -426,6 +443,26 @@ def main(argv=None):
     log(f"kernel version: {kver} | variant: {variant} | patches dir: {patches_dir}")
     manifest(f"configure v{CONFIGURE_VERSION} | kernel {kver} | variant {variant} | cwd {base}")
 
+    # 启动摘要（与闭源行为对齐：动作前打印配置摘要块）
+    zram_upper = args.zram.upper()
+    log("Kernel Configuration Summary")
+    log("-----------------------------")
+    for label, val in (
+        ("Kernel Version", kver), ("KernelSU Variant", variant), ("KSU Branch", args.ksu_branch),
+        ("Hookless Support", "Enabled" if args.hookless else "Disabled"),
+        ("SUSFS Support", "Enabled" if args.susfs else "Disabled"),
+        ("Baseband_guard Support", "Enabled" if args.with_bbg else "Disabled"),
+        ("Mountify Support", "Enabled" if args.mountify else "Disabled"),
+        ("Fengchi", "Enabled" if args.fengchi else "Disabled"),
+        ("KPM Support", "Enabled" if args.kpm else "Disabled"),
+        ("Multi Manager Support", "Disabled" if not args.multi_manager else "Enabled"),
+        ("Droidspace-OSS", "Enabled" if args.droidspace else "Disabled"),
+        ("NTSync", "Enabled" if args.ntsync else "Disabled"),
+        ("ZRAM Option", zram_upper),
+        ("Version Edit in gki_defconfig", "Disabled" if args.no_ver_edit else "Enabled"),
+    ):
+        log(f"    {label}: {val}")
+
     if args.dry_run:
         log("[dry-run] 计划：")
         log(f"  - CVE 补丁: {raw_url('github.com', pins['KERNEL_PATCHES_REPO'], pins['KERNEL_PATCHES_SHA'] or 'master', 'other/fix-CVE-2026-43499.patch')}")
@@ -433,6 +470,13 @@ def main(argv=None):
         if args.susfs:
             log(f"  - SUSFS: {pins['SUSFS_HOST']}/{pins['SUSFS_REPO']}@{pins['SUSFS_SHA'] or pins['SUSFS_BRANCH']} "
                 f"(spec={SUSFS_SPEC.get(kver, 'UNSUPPORTED')})")
+        if args.zram.upper() != "DISABLE":
+            log(f"  - ZRAM {args.zram.upper()}: "
+                f"{raw_url('github.com', pins['KERNEL_PATCHES_REPO'], pins['KERNEL_PATCHES_SHA'] or 'master', 'other/lib-Update-zram-to-1.10.0-6.6.118.patch')} "
+                f"(spec={ZRAM_LZ4_SPEC.get(kver, 'UNSUPPORTED') if args.zram.upper() == 'LZ4' else 'LZ4KD'})")
+        if args.kpm:
+            log(f"  - KPM: {pins['KPATCH_REPO']}@{pins['KPATCH_TAG']} (post-build Image patch, "
+                f"CONFIG_KALLSYMS_ALL 断言)")
         log("[dry-run] 完成（未做任何修改）")
         return 0
 
@@ -470,6 +514,9 @@ def main(argv=None):
 
     # ---- 2) KernelSU 变体注入 -------------------------------------------
     ksu_ref = pins["KSU_REF"] if args.ksu_branch == "default" else args.ksu_branch
+    if not ksu_ref and args.susfs and vinfo.get("susfs_branch"):
+        ksu_ref = vinfo["susfs_branch"]
+        log(f"SUSFS 模式：{variant} 使用集成分支 {ksu_ref}（依据闭源行为基线 §2）")
     if variant in ("RESUKISU", "RKSU", "SUKISU", "NEXT"):
         # 已验证路径：直接克隆到内核树内 KernelSU/，再执行其 setup.sh
         ksu_dest = os.path.join(kernel_common, "KernelSU")
@@ -617,25 +664,49 @@ def main(argv=None):
     zram = args.zram.upper()
     if zram == "LZ4":
         append_defconfig(kernel_common, ["CONFIG_ZRAM=y", "CONFIG_ZRAM_WRITEBACK=y"], "zram-lz4")
-        zrepo = pins["ZRAM_PATCH_REPO"]
-        zref = pins["ZRAM_PATCH_SHA"] or "main"
+        spec = ZRAM_LZ4_SPEC.get(kver)
+        if spec is None:
+            fail(f"ZRAM LZ4: 内核版本 {kver} 未配置（仅支持 {', '.join(ZRAM_LZ4_SPEC)}）")
         try:
-            p1 = os.path.join(pd, "001-lz4.patch")
-            os_download(raw_url("github.com", zrepo, zref, "zram_patch/001-lz4.patch"), p1)
-            rc, rejs, _fz, _o = apply_with_harvest(p1, kernel_common, 3, "zram-lz4", audit_root)
-            if rc != 0 or rejs:
-                warn(f"ZRAM LZ4 补丁未干净应用 (rc={rc}, rejects={rejs}) —— 记为降级")
-            else:
-                manifest("patch 001-lz4.patch -> OK")
-            s1 = os.path.join(pd, "lz4armv8.S")
-            os_download(raw_url("github.com", zrepo, zref, "zram_patch/lz4armv8.S"), s1)
-            # 参考实现放 common/lib；同时按补丁 rename 目标预置 lib/lz4/lz4armv8/
-            os.makedirs(os.path.join(kernel_common, "lib", "lz4", "lz4armv8"), exist_ok=True)
-            shutil.copyfile(s1, os.path.join(kernel_common, "lib", "lz4armv8.S"))
-            shutil.copyfile(s1, os.path.join(kernel_common, "lib", "lz4", "lz4armv8", "lz4armv8.S"))
-            manifest("lz4armv8.S -> lib/ + lib/lz4/lz4armv8/")
+            pl = os.path.join(pd, "lib-update-zram.patch")
+            os_download(kp_raw("other/lib-Update-zram-to-1.10.0-6.6.118.patch"), pl)
         except Exception as e:  # noqa: BLE001
-            warn(f"ZRAM LZ4 资源获取失败: {e}")
+            fail(f"ZRAM LZ4 补丁下载失败: {e}")
+        # 与闭源 118 行为一致：lib-Update 单补丁、fuzz=0、raw 字节；89 的树差异由 fixup + 显式删除收敛。
+        rc, rejs, _fz, _o = apply_with_harvest(pl, kernel_common, 0, "zram-lz4", audit_root)
+        unexpected = [x for x in rejs if x not in spec["expected_rejects"]]
+        if unexpected:
+            fail(f"ZRAM LZ4 出现预期外的 rejects: {unexpected} (rc={rc})")
+        if spec["fixup"]:
+            if not patches_dir:
+                fail(f"缺少 patches/ 目录（需要 {spec['fixup']}）")
+            fx = os.path.join(patches_dir, spec["fixup"])
+            if not os.path.isfile(fx):
+                fail(f"缺少修补补丁: {fx}")
+            rc2, rejs2, _f2, out2 = apply_with_harvest(fx, kernel_common, 0, "zramlz489fixup", audit_root)
+            if rc2 != 0 or rejs2:
+                fail(f"{spec['fixup']} 应用失败 (rc={rc2}, rejects={rejs2})\n{out2[-600:]}")
+            manifest(f"patch {spec['fixup']} -> OK (覆盖残留 hunk: {sorted(set(rejs)) or 'none'})")
+        elif rc != 0 or rejs:
+            fail(f"ZRAM LZ4 补丁未干净应用 (rc={rc}, rejects={rejs})")
+        # 89 差异：旧版 lib/lz4/lz4hc_compress.c 与补丁删除块内容不符（删除无法应用）——
+        # 由我们显式移除；功能上它正是被新 lib/lz4/lz4hc.c 取代的旧实现。
+        hc = os.path.join(kernel_common, "lib/lz4/lz4hc_compress.c")
+        if os.path.isfile(hc):
+            os.remove(hc)
+            manifest("removed lib/lz4/lz4hc_compress.c (superseded; patch 删除块内容差异)")
+        # 终态断言（防"半应用"再次溜进编译期）
+        for rel, want in (("lib/lz4/lz4armv8/lz4accel.c", True), ("lib/lz4/lz4armv8/lz4accel.h", True),
+                          ("lib/lz4/lz4armv8/lz4armv8.S", True), ("lib/lz4/lz4.c", True),
+                          ("lib/lz4/lz4hc.c", True), ("lib/lz4/lz4.h", True), ("lib/lz4/lz4hc.h", True),
+                          ("lib/lz4/lz4_compress.c", False), ("lib/lz4/lz4_decompress.c", False),
+                          ("lib/lz4/lz4defs.h", False), ("lib/lz4/lz4hc_compress.c", False)):
+            ex = os.path.exists(os.path.join(kernel_common, rel))
+            if ex != want:
+                fail(f"ZRAM LZ4 终态断言失败: {rel} exists={ex} want={want}")
+        if not grep_count(os.path.join(kernel_common, "fs/f2fs/compress.c"), "LZ4_arm64_decompress_safe"):
+            fail("ZRAM LZ4: fs/f2fs/compress.c 未包含 LZ4_arm64_decompress_safe（补丁未生效）")
+        manifest(f"patch lib-Update-zram-to-1.10.0-6.6.118.patch -> OK (fuzz=0, expected_rejects={sorted(spec['expected_rejects'])})")
     elif zram == "LZ4KD":
         append_defconfig(kernel_common, ["CONFIG_ZRAM=y", "CONFIG_ZRAM_LZ4KD=y"], "zram-lz4kd")
         try:
@@ -648,7 +719,7 @@ def main(argv=None):
                 manifest("patch lz4kd.patch -> OK")
         except Exception as e:  # noqa: BLE001
             warn(f"LZ4KD 补丁获取失败: {e}")
-    if zram in ("LZ4", "LZ4KD") and kver == "6.6.118":
+    if zram == "LZ4KD" and kver == "6.6.118":
         try:
             p2 = os.path.join(pd, "lib-update-zram-118.patch")
             os_download(kp_raw("other/lib-Update-zram-to-1.10.0-6.6.118.patch"), p2)
@@ -760,15 +831,22 @@ def main(argv=None):
         except Exception as e:  # noqa: BLE001
             warn(f"suki hooks 失败: {e}")
     if args.kpm:
+        # KPatch-Next 后置注入（release tag 由 pins 钉死；放开到全部 KSU 变体）
+        kpatch_tag = pins["KPATCH_TAG"]
         kptools = os.path.join(base, "kptools-linux")
         kpimg = os.path.join(base, "kpimg-linux")
+        rel_base = f"https://github.com/{pins['KPATCH_REPO']}/releases/download/{kpatch_tag}"
         try:
-            os_download("https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kptools-linux", kptools)
-            os_download("https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kpimg-linux", kpimg)
+            os_download(f"{rel_base}/kptools-linux", kptools)
+            os_download(f"{rel_base}/kpimg-linux", kpimg)
             os.chmod(kptools, 0o755)
-            manifest("KPM: kptools/kpimg downloaded")
+            manifest(f"KPM: KPatch-Next {kpatch_tag} tools ({pins['KPATCH_REPO']}) downloaded")
         except Exception as e:  # noqa: BLE001
-            warn(f"KPM 工具下载失败: {e}")
+            fail(f"KPM 工具下载失败: {e}")
+        # KPatch-Next 要求内核启用 KALLSYMS（建议同时 KALLSYMS_ALL）——断言兜底
+        dfk = os.path.join(kernel_common, "arch/arm64/configs/gki_defconfig")
+        if "CONFIG_KALLSYMS_ALL=y" not in read_text(dfk):
+            fail("KPM: gki_defconfig 缺少 CONFIG_KALLSYMS_ALL=y（KPatch-Next 需要）")
         if args.kpm_patch:
             img = os.path.abspath(args.kpm_patch)
             if not os.path.isfile(img):
