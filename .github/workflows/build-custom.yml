@@ -44,7 +44,7 @@ on:
           default: false
         KPM:
           type: boolean
-          description: "启用 KPM (白名单限制启用)"
+          description: "启用 KPM (KPatch-Next 后置注入，全变体可用)"
           default: false
         multi_manager:
           type: boolean
@@ -167,7 +167,7 @@ jobs:
           if [ "${{ github.event.inputs.BBG }}" == "true" ]; then
             ARGS+=" --with-bbg"
           fi
-          if [ "${{ github.event.inputs.KPM }}" == "true" ] && [ "${{ github.event.inputs.KSU }}" == "SUKISU" ]; then
+          if [ "${{ github.event.inputs.KPM }}" == "true" ]; then
             ARGS+=" --kpm"
           fi
           if [ "${{ github.event.inputs.mountify }}" == "true" ]; then
@@ -203,6 +203,20 @@ jobs:
           cd kernel_workspace/kernel_platform/common
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" RUSTC=../../prebuilts/rust/linux-x86/1.73.0b/bin/rustc PAHOLE=../../prebuilts/kernel-build-tools/linux-x86/bin/pahole LD=ld.lld HOSTLD=ld.lld O=out KCFLAGS+=-O2  gki_defconfig all
 
+      - name: Patch KPM (KPatch-Next)
+        if: inputs.KPM
+        run: |
+          cd kernel_workspace
+          test -x ./kptools-linux || { echo "[FATAL] kptools-linux 缺失（configure --kpm 未成功下载）"; exit 1; }
+          test -f ./kpimg-linux || { echo "[FATAL] kpimg-linux 缺失"; exit 1; }
+          IMG=kernel_platform/common/out/arch/arm64/boot/Image
+          test -f "$IMG" || { echo "[FATAL] Image 不存在: $IMG"; exit 1; }
+          ./kptools-linux -p -i "$IMG" -k ./kpimg-linux -o "$IMG.kpm"
+          mv -f "$IMG.kpm" "$IMG"
+          SIZE=$(stat -c%s "$IMG")
+          if [ "$SIZE" -lt 10000000 ]; then echo "[FATAL] patched Image 大小异常: $SIZE"; exit 1; fi
+          echo "KPM patched (KPatch-Next): $IMG ($SIZE bytes)"
+
       - name: Pack anykernel3
         run: |
          cd kernel_workspace/
@@ -216,7 +230,7 @@ jobs:
         if: inputs.UPLOAD_TO_GH
         uses: actions/upload-artifact@v7
         with:
-          name: Anykernel3
+          name: Anykernel3${{ inputs.KPM && '-kpm' || '' }}
           path: kernel_workspace/AnyKernel3_Op_ACE6.zip
           archive: false
 

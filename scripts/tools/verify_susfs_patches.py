@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""CI 门禁：校验 SUSFS 补丁对目标内核树的可应用性 + 关键补丁 URL 可用性。
+"""CI 门禁：校验 SUSFS / ZRAM-LZ4 补丁对目标内核树的可应用性 + 关键补丁 URL 可用性。
 
 背景（2026-09-15 实测矩阵，见仓库 notes/ 诊断报告）：
   - 6.6.118（OnePlusOSS android_kernel_common_oneplus_sm8750 @ oneplus/sm8750_b_16.0.0_ace_6）
@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root
@@ -47,6 +48,21 @@ TARGETS = [
     },
 ]
 
+ZRAM_TARGETS = [
+    {
+        "name": "zram-6.6.118",
+        "ref": "oneplus/sm8750_b_16.0.0_ace_6",
+        "expected_rejects": set(),
+        "fixup": None,
+    },
+    {
+        "name": "zram-6.6.89",
+        "ref": "36e8d60d4d1c97c08117cb0e733186515357cff3",
+        "expected_rejects": {"fs/f2fs/compress.c", "lib/lz4/lz4hc_compress.c"},
+        "fixup": "89-zram-lz4-fixup.patch",
+    },
+]
+
 DEFAULT_PINS = {
     "SUSFS_HOST": "gitlab.com",
     "SUSFS_REPO": "simonpunk/susfs4ksu",
@@ -54,8 +70,8 @@ DEFAULT_PINS = {
     "SUSFS_SHA": "",
     "KERNEL_PATCHES_REPO": "luyancib-org/kernel_patches",
     "KERNEL_PATCHES_SHA": "",
-    "ZRAM_PATCH_REPO": "cctv18/oppo_oplus_realme_sm8750",
-    "ZRAM_PATCH_SHA": "",
+    "KPATCH_REPO": "KernelSU-Next/KPatch-Next",
+    "KPATCH_TAG": "0.13.5-2",
     "NTSC_REPO": "Goldzxcbug/Droidspaces_Kernel_patch",
     "NTSC_SHA": "",
     "SUKI_HOOKS_REPO": "SukiSU-Ultra/SukiSU_patch",
@@ -88,9 +104,18 @@ def raw_url(host, repo, ref, path):
 
 
 def http_get(url, timeout=60, method="GET"):
-    req = urllib.request.Request(url, headers=UA, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.status, r.read()
+    """单次网络抖动（SSL EOF / 超时）不应红门禁：失败后重试一次。"""
+    last = None
+    for attempt in (1, 2):
+        try:
+            req = urllib.request.Request(url, headers=UA, method=method)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, r.read()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if attempt == 1:
+                time.sleep(3)
+    raise last
 
 
 def fetch_to(url, dest):
@@ -105,8 +130,6 @@ def check_urls(pins):
     """关键补丁 URL 可用性（防 404/改名）。返回失败列表。"""
     kp_ref = pins["KERNEL_PATCHES_SHA"] or "master"
     kp_repo = pins["KERNEL_PATCHES_REPO"]
-    zr_ref = pins["ZRAM_PATCH_SHA"] or "main"
-    zr_repo = pins["ZRAM_PATCH_REPO"]
     nt_ref = pins["NTSC_SHA"] or "main"
     checks = [
         raw_url("github.com", kp_repo, kp_ref, "other/fix-CVE-2026-43499.patch"),
@@ -120,8 +143,8 @@ def check_urls(pins):
         raw_url("github.com", kp_repo, kp_ref, "scope-miniminzed/scope-minnimized-hooks-v1.9.patch"),
         raw_url("github.com", pins["NTSC_REPO"], nt_ref, "NTsync/ntsync_base.patch"),
         raw_url("github.com", pins["NTSC_REPO"], nt_ref, "NTsync/ntsync_compat_android15-6.6.patch"),
-        raw_url("github.com", zr_repo, zr_ref, "zram_patch/001-lz4.patch"),
-        raw_url("github.com", zr_repo, zr_ref, "zram_patch/lz4armv8.S"),
+        f"https://github.com/{pins['KPATCH_REPO']}/releases/download/{pins['KPATCH_TAG']}/kptools-linux",
+        f"https://github.com/{pins['KPATCH_REPO']}/releases/download/{pins['KPATCH_TAG']}/kpimg-linux",
         raw_url("github.com", pins["SUKI_HOOKS_REPO"], "main", "hooks/syscall_hooks.patch"),
     ]
     fails = []
@@ -169,6 +192,19 @@ def patch_file_list(patch_path):
     return files
 
 
+def patch_file_list_ex(patch_path):
+    """[(b-side path, is_new_file)]：new 文件由补丁创建，不应从目标树抓取。"""
+    txt = open(patch_path, encoding="utf-8", errors="replace").read()
+    out = []
+    for blk in re.split(r"(?m)^(?=diff --git )", txt):
+        m = re.match(r"diff --git a/(\S+) b/(\S+)", blk)
+        if not m:
+            continue
+        is_new = ("new file mode" in blk) or ("\n--- /dev/null" in blk)
+        out.append((m.group(2), is_new))
+    return out
+
+
 def run(cmd, cwd=None):
     p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     return p.returncode, p.stdout
@@ -183,6 +219,76 @@ def find_rejects(tree):
     return sorted(out)
 
 
+def verify_zram_lz4(t, pins, workdir):
+    log(f"\n==== zram-lz4 target {t['name']} ({t['ref']}) ====")
+    kp_ref = pins["KERNEL_PATCHES_SHA"] or "master"
+    url = raw_url("github.com", pins["KERNEL_PATCHES_REPO"], kp_ref,
+                  "other/lib-Update-zram-to-1.10.0-6.6.118.patch")
+    patch_path = os.path.join(workdir, "lib-update-zram.patch")
+    fetch_to(url, patch_path)
+
+    tree = os.path.join(workdir, "tree")
+    missing = []
+    for f, is_new in patch_file_list_ex(patch_path):
+        if is_new:
+            continue
+        try:
+            fetch_to(raw_url("github.com", ONE_PLUS_REPO, t["ref"], f), os.path.join(tree, f))
+        except Exception:  # noqa: BLE001
+            missing.append(f)
+    if missing:
+        return [f"{t['name']}: kernel tree files missing: {missing}"]
+
+    fails = []
+    rc, out = run(["patch", "-p1", "--batch", "--fuzz=0", "--forward", "-i", patch_path], cwd=tree)
+    rejects = sorted(r[: -len(".rej")] for r in find_rejects(tree))
+    if set(rejects) != t["expected_rejects"]:
+        fails.append(f"{t['name']}: lib-update rejects={rejects} 期望={sorted(t['expected_rejects'])}")
+        log("  patch tail:\n    " + "\n    ".join(out.strip().splitlines()[-8:]))
+    else:
+        log(f"  lib-update apply OK (rc={rc}, rejects={rejects or 'none'})")
+
+    if rejects:
+        stash = os.path.join(workdir, "rejects")
+        os.makedirs(stash, exist_ok=True)
+        for r in find_rejects(tree):
+            shutil.move(os.path.join(tree, r), os.path.join(stash, r.replace("/", "__")))
+
+    if t["fixup"]:
+        fx = os.path.join(PATCHES_DIR, t["fixup"])
+        if not os.path.isfile(fx):
+            fails.append(f"{t['name']}: fixup missing: {fx}")
+        else:
+            rc2, out2 = run(["patch", "-p1", "--batch", "--fuzz=0", "--forward", "-i", fx], cwd=tree)
+            new_rejects = find_rejects(tree)
+            if rc2 != 0 or new_rejects:
+                fails.append(f"{t['name']}: fixup 应用失败 rc={rc2} rejects={new_rejects}")
+                log("  fixup tail:\n    " + "\n    ".join(out2.strip().splitlines()[-8:]))
+            else:
+                log("  fixup apply OK (rc=0)")
+
+    # 89 差异：旧 lz4hc_compress.c 由新 lz4hc.c 取代（删除块内容不符 → 显式移除）
+    hc = os.path.join(tree, "lib/lz4/lz4hc_compress.c")
+    if os.path.isfile(hc):
+        os.remove(hc)
+
+    for rel, want in (
+        ("lib/lz4/lz4.c", True), ("lib/lz4/lz4.h", True), ("lib/lz4/lz4hc.c", True),
+        ("lib/lz4/lz4hc.h", True), ("lib/lz4/lz4armv8/lz4accel.c", True),
+        ("lib/lz4/lz4armv8/lz4accel.h", True), ("lib/lz4/lz4armv8/lz4armv8.S", True),
+        ("lib/lz4/lz4_compress.c", False), ("lib/lz4/lz4_decompress.c", False),
+        ("lib/lz4/lz4defs.h", False), ("lib/lz4/lz4hc_compress.c", False),
+    ):
+        if os.path.exists(os.path.join(tree, rel)) != want:
+            fails.append(f"{t['name']}: 断言失败 {rel} exists != {want}")
+    ccp = os.path.join(tree, "fs/f2fs/compress.c")
+    if "LZ4_arm64_decompress_safe" not in open(ccp, encoding="utf-8", errors="replace").read():
+        fails.append(f"{t['name']}: fs/f2fs/compress.c 缺少 LZ4_arm64_decompress_safe")
+    if not fails:
+        log(f"  PASS: {t['name']}")
+    return fails
+
+
 def verify_target(t, pins, workdir):
     log(f"\n==== target {t['name']} ({t['ref']}) ====")
     susfs = fetch_susfs(pins, workdir)
@@ -194,7 +300,9 @@ def verify_target(t, pins, workdir):
 
     tree = os.path.join(workdir, "tree")
     missing = []
-    for f in patch_file_list(patch50):
+    for f, is_new in patch_file_list_ex(patch50):
+        if is_new:
+            continue
         url = raw_url("github.com", ONE_PLUS_REPO, t["ref"], f)
         try:
             fetch_to(url, os.path.join(tree, f))
@@ -262,6 +370,16 @@ def main():
             os.makedirs(wd, exist_ok=True)
             try:
                 fails += verify_target(t, pins, wd)
+            except Exception as e:  # noqa: BLE001
+                fails.append(f"{t['name']}: 校验异常: {e}")
+
+    log("\n== 阶段 C：ZRAM-LZ4 补丁 × 内核树 矩阵 ==")
+    with tempfile.TemporaryDirectory(prefix="verify_zram_") as td:
+        for t in ZRAM_TARGETS:
+            wd = os.path.join(td, t["name"].replace(".", "_"))
+            os.makedirs(wd, exist_ok=True)
+            try:
+                fails += verify_zram_lz4(t, pins, wd)
             except Exception as e:  # noqa: BLE001
                 fails.append(f"{t['name']}: 校验异常: {e}")
 

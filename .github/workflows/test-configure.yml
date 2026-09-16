@@ -43,10 +43,13 @@ jobs:
       - name: dry-run works, plans pinned sources, makes no changes
         run: |
           cd /tmp/mock
-          python3 configure --ksu-variant RESUKISU --ksu-branch default --susfs --dry-run | tee /tmp/dry.log
+          python3 configure --ksu-variant RESUKISU --ksu-branch default --susfs --zram LZ4 --kpm --dry-run | tee /tmp/dry.log
           grep -q "dry-run" /tmp/dry.log
           grep -q "susfs4ksu" /tmp/dry.log
           grep -q "89-susfs-fixup.patch" /tmp/dry.log
+          grep -q "lib-Update-zram-to-1.10.0-6.6.118.patch" /tmp/dry.log
+          grep -q "89-zram-lz4-fixup.patch" /tmp/dry.log
+          grep -q "KPatch-Next" /tmp/dry.log
           # dry-run 不得写入 defconfig
           ! grep -q "configure appended" kernel_platform/common/arch/arm64/configs/gki_defconfig
           ! grep -q "# ---" kernel_platform/common/arch/arm64/configs/gki_defconfig
