@@ -64,6 +64,8 @@ ZRAM_TARGETS = [
 ]
 
 DEFAULT_PINS = {
+    "KSU_REPO": "ReSukiSU/ReSukiSU",
+    "KSU_REF": "",
     "SUSFS_HOST": "gitlab.com",
     "SUSFS_REPO": "simonpunk/susfs4ksu",
     "SUSFS_BRANCH": "gki-android15-6.6",
@@ -217,6 +219,31 @@ def find_rejects(tree):
             if f.endswith(".rej"):
                 out.append(os.path.relpath(os.path.join(root, f), tree).replace("\\", "/"))
     return sorted(out)
+
+
+def check_ksu_side_susfs(pins):
+    """阶段 D：KSU 侧内置 SUSFS 证据固化（防"跳过 10_ 补丁"的依据过时）。
+
+    RESUKISU/RKSU/SUKISU 走"内置 SUSFS"路径（不应用 KernelSU 侧 10_ 补丁）。
+    本检查直接验证钉死版本（KSU_REPO@KSU_REF）的 kernel/Kconfig 含 `config KSU_SUSFS`；
+    若上游未来移除该特性（或升级 KSU_REF 后消失）→ 门禁红灯（需要改走 manual 路径或回退版本）。
+    """
+    repo = pins["KSU_REPO"]
+    ref = pins["KSU_REF"] or "main"
+    url = raw_url("github.com", repo, ref, "kernel/Kconfig")
+    fails = []
+    try:
+        status, data = http_get(url, timeout=60)
+        if status != 200:
+            fails.append(f"KSU 侧检查: {url} -> HTTP {status}")
+        elif b"config KSU_SUSFS" not in data:
+            fails.append(f"KSU 侧检查: {repo}@{ref} 的 kernel/Kconfig 无 'config KSU_SUSFS'"
+                         f"（内置 SUSFS 支持缺失，跳过 10_ 补丁的依据已失效）")
+        else:
+            log(f"  [KSU] {repo}@{ref}: kernel/Kconfig 含 config KSU_SUSFS ✓")
+    except Exception as e:  # noqa: BLE001
+        fails.append(f"KSU 侧检查失败: {e}")
+    return fails
 
 
 def verify_zram_lz4(t, pins, workdir):
@@ -382,6 +409,9 @@ def main():
                 fails += verify_zram_lz4(t, pins, wd)
             except Exception as e:  # noqa: BLE001
                 fails.append(f"{t['name']}: 校验异常: {e}")
+
+    log("\n== 阶段 D：KSU 侧内置 SUSFS（钉死版本证据固化）==")
+    fails += check_ksu_side_susfs(pins)
 
     log("\n================ 结果 ================")
     if fails:
