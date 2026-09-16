@@ -1,0 +1,35 @@
+diff --git a/net/core/net_namespace.c b/net/core/net_namespace.c
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@ -430,7 +430,7 @@
+ #ifdef CONFIG_KEYS
+ 	net->key_domain = kzalloc(sizeof(struct key_tag), GFP_KERNEL);
+ 	if (!net->key_domain)
+-		goto out_free_3;
++		goto out_free_2;
+ 	refcount_set(&net->key_domain->usage, 1);
+ #endif
+ 
+@@ -438,20 +438,12 @@
+ out:
+ 	return net;
+ 
+-#ifdef CONFIG_KEYS
+-out_free_3:
+-#endif
++#if defined(CONFIG_KEYS) || defined(CONFIG_NF_TABLES) || defined(CONFIG_NF_TABLES_MODULE)
++out_free_2:
+ #if defined(CONFIG_NF_TABLES) || defined(CONFIG_NF_TABLES_MODULE)
+ 	kfree(net->ext);
+ 	net->ext = NULL;
+ #endif
+-#ifdef CONFIG_KEYS
+-out_free_2:
+-	kmem_cache_free(net_cachep, net);
+-	net = NULL;
+-#endif
+-#if !defined(CONFIG_KEYS)
+-out_free_2:
+ 	kmem_cache_free(net_cachep, net);
+ 	net = NULL;
+ #endif

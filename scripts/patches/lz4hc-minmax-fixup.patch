@@ -1,0 +1,20 @@
+diff --git a/lib/lz4/lz4hc.c b/lib/lz4/lz4hc.c
+--- a/lib/lz4/lz4hc.c
++++ b/lib/lz4/lz4hc.c
+@@ -65,6 +65,16 @@
+ #endif
+ #define LZ4_COMMONDEFS_ONLY
+ #include "lz4.c" /* LZ4_count, constants, mem */
++#endif
++
++/* Linux kernel port fallback: 部分内树 (如 6.6.89) 不提供 MIN/MAX 宏；
++ * lz4.c 的 #define MIN 仅在完整编译模式下生效（本文件以 LZ4_COMMONDEFS_ONLY 包含它），
++ * 故此处给出带守卫的兜底定义（对已提供该宏的内树为 no-op）。 */
++#ifndef MIN
++#define MIN(a, b) ((a) < (b) ? (a) : (b))
++#endif
++#ifndef MAX
++#define MAX(a, b) ((a) > (b) ? (a) : (b))
+ #endif
+ 
+ /*===   Enums   ===*/

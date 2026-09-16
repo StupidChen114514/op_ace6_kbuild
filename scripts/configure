@@ -689,6 +689,18 @@ def main(argv=None):
             manifest(f"patch {spec['fixup']} -> OK (覆盖残留 hunk: {sorted(set(rejs)) or 'none'})")
         elif rc != 0 or rejs:
             fail(f"ZRAM LZ4 补丁未干净应用 (rc={rc}, rejects={rejs})")
+        # lib/lz4/lz4hc.c 依赖环境提供 MIN/MAX（6.6.89 树无、较新树有厂商版）；
+        # lz4.c 里的定义在该翻译单元（LZ4_COMMONDEFS_ONLY 模式）不生效 →
+        # 打上带守卫的兜底定义（对已提供该宏的树为 no-op）。
+        ff = os.path.join(patches_dir, "lz4hc-minmax-fixup.patch") if patches_dir else None
+        if not ff or not os.path.isfile(ff):
+            fail("缺少修补补丁: lz4hc-minmax-fixup.patch")
+        rc3, rejs3, _f3, out3 = apply_with_harvest(ff, kernel_common, 0, "lz4hc-minmax", audit_root)
+        if rc3 != 0 or rejs3:
+            fail(f"lz4hc-minmax-fixup 应用失败 (rc={rc3}, rejects={rejs3})\n{out3[-600:]}")
+        if "ifndef MIN" not in read_text(os.path.join(kernel_common, "lib/lz4/lz4hc.c")):
+            fail("lz4hc-minmax-fixup 未生效（MIN 兜底缺失）")
+        manifest("patch lz4hc-minmax-fixup.patch -> OK (MIN/MAX 兜底；对提供该宏的树为 no-op)")
         # 89 差异：旧版 lib/lz4/lz4hc_compress.c 与补丁删除块内容不符（删除无法应用）——
         # 由我们显式移除；功能上它正是被新 lib/lz4/lz4hc.c 取代的旧实现。
         hc = os.path.join(kernel_common, "lib/lz4/lz4hc_compress.c")
@@ -786,6 +798,19 @@ def main(argv=None):
                 warn(f"droidspace 补丁未干净应用 (rejects={rejs})")
             else:
                 manifest("patch droidspace -> OK")
+                # netns 修复：droidspace 的 out_free_2 标签在「KEYS=y & NF_TABLES=n」组合下
+                # unused（-Werror 编译失败）；修补为"标签随任一路径存在 + KEYS 失败改跳 out_free_2"
+                # （四种配置组合均可编译，语义不变）。
+                fx = os.path.join(patches_dir, "droidspace-netns-fixup.patch") if patches_dir else None
+                if not fx or not os.path.isfile(fx):
+                    fail("缺少修补补丁: droidspace-netns-fixup.patch")
+                rc2, rejs2, _f2, out2 = apply_with_harvest(fx, kernel_common, 0, "droidspace-netns", audit_root)
+                if rc2 != 0 or rejs2:
+                    fail(f"droidspace-netns-fixup 应用失败 (rc={rc2}, rejects={rejs2})\n{out2[-600:]}")
+                nn = read_text(os.path.join(kernel_common, "net/core/net_namespace.c"))
+                if "out_free_3" in nn or "#if !defined(CONFIG_KEYS)\nout_free_2:" in nn:
+                    fail("droidspace-netns-fixup 未生效（netns 标签修复缺失）")
+                manifest("patch droidspace-netns-fixup.patch -> OK (netns 标签四组合可编译)")
         except Exception as e:  # noqa: BLE001
             warn(f"droidspace 失败: {e}")
     if args.ntsync:
