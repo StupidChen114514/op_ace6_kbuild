@@ -14,6 +14,7 @@
 用法：python3 scripts/tools/verify_susfs_patches.py
 """
 
+import json
 import os
 import re
 import shutil
@@ -106,17 +107,17 @@ def raw_url(host, repo, ref, path):
 
 
 def http_get(url, timeout=60, method="GET"):
-    """单次网络抖动（SSL EOF / 超时）不应红门禁：失败后重试一次。"""
+    """单次网络抖动（SSL EOF / 超时）不应红门禁：失败后重试两次。"""
     last = None
-    for attempt in (1, 2):
+    for attempt in (1, 2, 3):
         try:
             req = urllib.request.Request(url, headers=UA, method=method)
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.status, r.read()
         except Exception as e:  # noqa: BLE001
             last = e
-            if attempt == 1:
-                time.sleep(3)
+            if attempt < 3:
+                time.sleep(3 * attempt)
     raise last
 
 
@@ -133,6 +134,17 @@ def check_urls(pins):
     kp_ref = pins["KERNEL_PATCHES_SHA"] or "master"
     kp_repo = pins["KERNEL_PATCHES_REPO"]
     nt_ref = pins["NTSC_SHA"] or "main"
+    # KPATCH_TAG 置空（latest 分支）= 解析最新 release；解析不了则显式失败（不静默）
+    fails_pre = []
+    kpatch_tag = pins["KPATCH_TAG"]
+    if not kpatch_tag:
+        try:
+            _, body = http_get(f"https://api.github.com/repos/{pins['KPATCH_REPO']}/releases/latest", timeout=45)
+            kpatch_tag = json.loads(body.decode())["tag_name"]
+            log(f"  [KPM] KPATCH_TAG 为空 -> 最新 release = {kpatch_tag}")
+        except Exception as e:  # noqa: BLE001
+            log(f"  [KPM] KPATCH_TAG 为空且解析最新 release 失败: {e}")
+            fails_pre.append(f"{pins['KPATCH_REPO']}: KPATCH_TAG 为空且最新 release 解析失败（无法校验）")
     checks = [
         raw_url("github.com", kp_repo, kp_ref, "other/fix-CVE-2026-43499.patch"),
         raw_url("github.com", kp_repo, kp_ref, "other/fix_display_for_118.patch"),
@@ -145,11 +157,14 @@ def check_urls(pins):
         raw_url("github.com", kp_repo, kp_ref, "scope-miniminzed/scope-minnimized-hooks-v1.9.patch"),
         raw_url("github.com", pins["NTSC_REPO"], nt_ref, "NTsync/ntsync_base.patch"),
         raw_url("github.com", pins["NTSC_REPO"], nt_ref, "NTsync/ntsync_compat_android15-6.6.patch"),
-        f"https://github.com/{pins['KPATCH_REPO']}/releases/download/{pins['KPATCH_TAG']}/kptools-linux",
-        f"https://github.com/{pins['KPATCH_REPO']}/releases/download/{pins['KPATCH_TAG']}/kpimg-linux",
         raw_url("github.com", pins["SUKI_HOOKS_REPO"], "main", "hooks/syscall_hooks.patch"),
     ]
-    fails = []
+    if kpatch_tag:
+        checks += [
+            f"https://github.com/{pins['KPATCH_REPO']}/releases/download/{kpatch_tag}/kptools-linux",
+            f"https://github.com/{pins['KPATCH_REPO']}/releases/download/{kpatch_tag}/kpimg-linux",
+        ]
+    fails = list(fails_pre)
     for u in checks:
         try:
             status, _ = http_get(u, timeout=45)
