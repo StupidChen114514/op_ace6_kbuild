@@ -11,6 +11,8 @@ on:
     branches:
       - "fix/**"
       - "trae/**"
+      - "stable"
+      - "latest"
       - "main"
     paths:
       - "scripts/**"

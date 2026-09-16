@@ -35,6 +35,7 @@ configure v2 — OnePlus Ace6 内核构建配置器（开源）
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -475,7 +476,7 @@ def main(argv=None):
                 f"{raw_url('github.com', pins['KERNEL_PATCHES_REPO'], pins['KERNEL_PATCHES_SHA'] or 'master', 'other/lib-Update-zram-to-1.10.0-6.6.118.patch')} "
                 f"(spec={ZRAM_LZ4_SPEC.get(kver, 'UNSUPPORTED') if args.zram.upper() == 'LZ4' else 'LZ4KD'})")
         if args.kpm:
-            log(f"  - KPM: {pins['KPATCH_REPO']}@{pins['KPATCH_TAG']} (post-build Image patch, "
+            log(f"  - KPM: {pins['KPATCH_REPO']}@{pins['KPATCH_TAG'] or 'latest'} (post-build Image patch, "
                 f"CONFIG_KALLSYMS_ALL 断言)")
         log("[dry-run] 完成（未做任何修改）")
         return 0
@@ -856,8 +857,18 @@ def main(argv=None):
         except Exception as e:  # noqa: BLE001
             warn(f"suki hooks 失败: {e}")
     if args.kpm:
-        # KPatch-Next 后置注入（release tag 由 pins 钉死；放开到全部 KSU 变体）
+        # KPatch-Next 后置注入（release tag 由 pins 钉死；置空 = 解析最新 release）
         kpatch_tag = pins["KPATCH_TAG"]
+        if not kpatch_tag:
+            # latest 分支模式：跟随最新 release
+            try:
+                req = urllib.request.Request(
+                    f"https://api.github.com/repos/{pins['KPATCH_REPO']}/releases/latest",
+                    headers={"User-Agent": "ace6-configure", "Accept": "application/vnd.github+json"})
+                kpatch_tag = json.loads(urllib.request.urlopen(req, timeout=30).read().decode())["tag_name"]
+                manifest(f"KPM: KPATCH_TAG 为空 -> 解析最新 release = {kpatch_tag}")
+            except Exception as e:  # noqa: BLE001
+                fail(f"KPM: 解析最新 release 失败（KPATCH_TAG 置空时需可达 api.github.com）: {e}")
         kptools = os.path.join(base, "kptools-linux")
         kpimg = os.path.join(base, "kpimg-linux")
         rel_base = f"https://github.com/{pins['KPATCH_REPO']}/releases/download/{kpatch_tag}"

@@ -6,6 +6,8 @@ on:
     branches:
       - "fix/**"
       - "trae/**"
+      - "stable"
+      - "latest"
     paths:
       - "scripts/configure"
       - "scripts/pins.env"
