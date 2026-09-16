@@ -18,8 +18,10 @@ The open-source tool `scripts/configure` (Python) acts as a build-time helper:
 
 - It parses the same CLI arguments the workflow passes (`--ksu-variant`, `--ksu-branch`, `--susfs`, `--zram LZ4|LZ4KD`, `--kpm`, `--mountify`, `--ntsync`, `--fengchi`, `--droidspace`, `--with-bbg`, `--hookless`, `--multi-manager`, `--no-ver-edit`), installing the selected KernelSU variant, integrating SUSFS when enabled (including the ReSukiSU/NEXT "integrated branch" path), applying optional feature patches, and appending CONFIG lines to `gki_defconfig`.
 - It contains **no whitelist/blacklist remote-control logic**. All features are driven purely by local CLI switches, and the script is fully auditable.
+- KPM uses **KPatch-Next post-build injection** (release tag pinned in `pins.env`): the workflow patches the compiled Image after the build, available for all KSU variants; the artifact name carries a `-kpm` suffix.
+- ZRAM LZ4 uses the same single-patch approach as the upstream closed-source tool: `lib-Update-zram-to-1.10.0-6.6.118.patch` (clean on 6.6.118; 6.6.89 tree differences are reconciled by `scripts/patches/89-zram-lz4-fixup.patch`).
 - Version pinning via `scripts/pins.env` (upstream SHAs, env-overridable) and a per-build `build_manifest.txt` recording every resolved source and patch result.
-- **Strict failure semantics**: if a critical integration step (SUSFS / KernelSU / BBG) fails, the configure step exits non-zero immediately instead of failing minutes later inside the kernel build.
+- **Strict failure semantics**: if a critical integration step (SUSFS / KernelSU / BBG / ZRAM LZ4) fails, the configure step exits non-zero immediately instead of failing minutes later inside the kernel build.
 - Patch applicability for both kernel generations (6.6.89 / 6.6.118) is continuously checked by the `verify patches` CI workflow.
 
 ## Usage
