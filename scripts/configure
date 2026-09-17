@@ -102,6 +102,19 @@ ZRAM_LZ4_SPEC = {
                 "fixup": "89-zram-lz4-fixup.patch"},
 }
 
+# 容器/运行时配置（与闭源 configure 的 config_main 追加清单对账得出；上游成功运行的对象集实证：
+# kernel/pid_namespace.o、ipc/*.o、drivers/base/devtmpfs.o、net/netfilter/nf_tables_*.o、nft_*.o 只有它编出来）
+CONTAINER_CONFIGS = [
+    "CONFIG_HEADERS_INSTALL=y",
+    "CONFIG_OVERLAY_FS=y",
+    "CONFIG_PID_NS=y",
+    "CONFIG_DEVTMPFS=y",
+    "CONFIG_SYSVIPC=y",
+    "CONFIG_IPC_NS=y",
+    "CONFIG_POSIX_MQUEUE=y",
+    "CONFIG_NF_TABLES=y",
+]
+
 # SUSFS 完整性断言（镜像 ReSukiSU 的编译期 hook 检查，问题提前到 configure 阶段暴露）
 SUSFS_ASSERTS = [
     ("fs/exec.c", "ksu_handle_execveat", 1),
@@ -478,6 +491,7 @@ def main(argv=None):
         if args.kpm:
             log(f"  - KPM: {pins['KPATCH_REPO']}@{pins['KPATCH_TAG'] or 'latest'} (post-build Image patch, "
                 f"CONFIG_KALLSYMS_ALL 断言)")
+        log("  - defconfig 追加: " + ", ".join(CONTAINER_CONFIGS))
         log("[dry-run] 完成（未做任何修改）")
         return 0
 
@@ -901,6 +915,17 @@ def main(argv=None):
     if os.path.isfile(df):
         sed_file("-4k", "", df)
         sed_file("CONFIG_ZRAM=m", "CONFIG_ZRAM=y", df)
+        # 容器/运行时配置（与闭源 configure 行为对齐）：
+        # - 缺这些 → droidspace 等容器功能不完整；
+        # - 且 KEYS=y & NF_TABLES=n 时 net/core/net_namespace.c 的 out_free_2 标签 unused（-Werror）。
+        append_defconfig(kernel_common, list(CONTAINER_CONFIGS),
+                         "container/runtime (parity with closed configure)")
+        _dfc = read_text(df)
+        _missing = [x for x in CONTAINER_CONFIGS if x not in _dfc]
+        if _missing:
+            fail(f"容器配置未写入 defconfig: {_missing}")
+        manifest("defconfig: container/runtime 配置已追加 "
+                 "(PID_NS/SYSVIPC/IPC_NS/POSIX_MQUEUE/DEVTMPFS/NF_TABLES/OVERLAY_FS/HEADERS_INSTALL)")
 
     # ---- 9) 摘要与清单 ---------------------------------------------------
     summary_lines = [
